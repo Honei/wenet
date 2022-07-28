@@ -55,6 +55,7 @@ done
 
 mkdir -p data/train data/dev data/test
 
+# 生成出来的标注文本是字粒度，每个字用空格分开
 for f in wav.scp text; do
   cp $train_dir/$f data/train/$f || exit 1;
   cp $dev_dir/$f data/dev/$f || exit 1;

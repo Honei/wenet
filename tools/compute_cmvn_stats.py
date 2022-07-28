@@ -14,7 +14,6 @@ from torch.utils.data import Dataset, DataLoader
 
 torchaudio.set_audio_backend("sox_io")
 
-
 class CollateFunc(object):
     ''' Collate function for AudioDataset
     '''
@@ -28,6 +27,10 @@ class CollateFunc(object):
         mean_stat = torch.zeros(self.feat_dim)
         var_stat = torch.zeros(self.feat_dim)
         number = 0
+
+        # 每一个样本是一个元祖
+        # 元祖的第一个元素是音频的名称
+        # 元祖的第二个元素是音频的路径
         for item in batch:
             value = item[1].strip().split(",")
             assert len(value) == 3 or len(value) == 1
@@ -44,19 +47,25 @@ class CollateFunc(object):
                     num_frames=end_frame - start_frame,
                     frame_offset=start_frame)
             else:
+                # 通常都是一个音频，即len(value) == 1
                 waveform, sample_rate = torchaudio.load(item[1])
 
+            # 将音频从int16转换为float32数据
             waveform = waveform * (1 << 15)
             if self.resample_rate != 0 and self.resample_rate != sample_rate:
                 resample_rate = self.resample_rate
                 waveform = torchaudio.transforms.Resample(
                     orig_freq=sample_rate, new_freq=resample_rate)(waveform)
 
+            # 计算kaldi特征，提取80维度的FBANK
+            # 真实计算的时候，没有使用dither
             mat = kaldi.fbank(waveform,
                               num_mel_bins=self.feat_dim,
                               dither=0.0,
                               energy_floor=0.0,
                               sample_frequency=resample_rate)
+            # 计算所有特征的总和
+            # 以及计算所有特征的平方
             mean_stat += torch.sum(mat, axis=0)
             var_stat += torch.sum(torch.square(mat), axis=0)
             number += mat.shape[0]
@@ -99,6 +108,8 @@ if __name__ == '__main__':
     with open(args.train_config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
     feat_dim = configs['dataset_conf']['fbank_conf']['num_mel_bins']
+    
+    # 将所有的音频重新采样为16k
     resample_rate = 0
     if 'resample_conf' in configs['dataset_conf']:
         resample_rate = configs['dataset_conf']['resample_conf']['resample_rate']
@@ -131,6 +142,9 @@ if __name__ == '__main__':
                       file=sys.stderr,
                       flush=True)
 
+    # 计算CMVN的统计信息
+    # 真实的cmvn=E[x^2] - (E[x])^2
+    # 可以根据mean_stat, var_stat, frame_num计算得到
     cmvn_info = {
         'mean_stat': list(all_mean_stat.tolist()),
         'var_stat': list(all_var_stat.tolist()),
