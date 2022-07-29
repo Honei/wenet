@@ -111,7 +111,10 @@ def main():
     n = args.nchar
     while line:
         x = line.split()
+        # 输出所有保留的内容，最后一个符号不是换行，而是空格
         print(' '.join(x[:args.skip_ncols]), end=" ")
+
+        # 缓存下每一行剩下的内容
         a = ' '.join(x[args.skip_ncols:])
 
         # get all matched positions
@@ -154,15 +157,20 @@ def main():
                         for k in sp.encode_as_pieces(l):
                             a.append(k)
         else:
+            # 每隔n个字符进行切割，切割只有a是一个列表
             a = [a[j:j + n] for j in range(0, len(a), n)]
 
+        # 将切割之后的每隔列表内部合并在一起
         a_flat = []
         for z in a:
             a_flat.append("".join(z))
 
+        # 将空格以<sapce>替代
         a_chars = [z.replace(' ', args.space) for z in a_flat]
         if (args.trans_type == "phn"):
             a_chars = [z.replace("sil", args.space) for z in a_chars]
+        
+        # 每隔单元以空格分隔开来
         print(' '.join(a_chars))
         line = f.readline()
 
