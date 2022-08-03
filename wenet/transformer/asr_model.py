@@ -32,7 +32,10 @@ from wenet.utils.mask import (make_pad_mask, mask_finished_preds,
 
 
 class ASRModel(torch.nn.Module):
-    """CTC-attention hybrid Encoder-Decoder model"""
+    """CTC-attention hybrid Encoder-Decoder model
+        在 ASRModel中，包装了ASR 的处理过程
+        ASRModel是一个ctc/Attention的混合模型
+    """
     def __init__(
         self,
         vocab_size: int,
@@ -45,20 +48,38 @@ class ASRModel(torch.nn.Module):
         lsm_weight: float = 0.0,
         length_normalized_loss: bool = False,
     ):
+        """
+            vocab_size: 表示词典
+            encoder: encoder+ctc框架中encoder的部分
+            decoder: 使用attention解码的部分
+            ctc: ctc 损失函数
+            ctc_weight: ctc/attention框架中，ctc损失函数的权重
+            ignore_id: 不同音频长度进行补齐时，补齐的符号
+            reverse_weight: 在decoder中，如果有反向解码，计算decoder的loss时，方向解码时loss的权重
+            lsm_weight: 在decoder中，使用label smoothing技术时，label smothing的值
+            length_normalized_loss: 对decoder最后的loss进行归一化时，使用batch_size归一化还是使用有效字符的长度进行归一化
+                                    设置为True时，表示使用有效字符的长度进行归一化
+        """
         assert 0.0 <= ctc_weight <= 1.0, ctc_weight
 
         super().__init__()
         # note that eos is the same as sos (equivalent ID)
+        # 在ASR中sos和eos使用相同的符号
         self.sos = vocab_size - 1
         self.eos = vocab_size - 1
         self.vocab_size = vocab_size
         self.ignore_id = ignore_id
         self.ctc_weight = ctc_weight
         self.reverse_weight = reverse_weight
-
+        
+        # 确定encoder， decoder， loss function和 label smoothing loss
+        # 训练过程中需要的网络部分都有了
+        # 目前encoder选择ConformerEncoder
         self.encoder = encoder
         self.decoder = decoder
         self.ctc = ctc
+
+        # attention分支中，使用LabelSmoothing技术
         self.criterion_att = LabelSmoothingLoss(
             size=vocab_size,
             padding_idx=ignore_id,
@@ -87,11 +108,19 @@ class ASRModel(torch.nn.Module):
                 text_lengths.shape[0]), (speech.shape, speech_lengths.shape,
                                          text.shape, text_lengths.shape)
         # 1. Encoder
+        #    在正常训练的过程中，可以不需要encoder+decoder框架中的decoder
+        #    speech的维度信息是 (batch, times, feature_dim)
+        #    wenet使用Fbank，维度是80
+        #    那么每次计算时维度为(batch, times, 80)
+        #    speech_lengths 表示每个音频的长度，这里长度是语音帧的数目
+        #    目前encoder选择ConformerEncoder
         encoder_out, encoder_mask = self.encoder(speech, speech_lengths)
         encoder_out_lens = encoder_mask.squeeze(1).sum(1)
 
         # 2a. Attention-decoder branch
         if self.ctc_weight != 1.0:
+            # loss_att 是loss function
+            # acc_att是符号的正确率
             loss_att, acc_att = self._calc_att_loss(encoder_out, encoder_mask,
                                                     text, text_lengths)
         else:
@@ -109,6 +138,7 @@ class ASRModel(torch.nn.Module):
         elif loss_att is None:
             loss = loss_ctc
         else:
+            # 两个方式联合起来，得到最后的attention结果
             loss = self.ctc_weight * loss_ctc + (1 -
                                                  self.ctc_weight) * loss_att
         return {"loss": loss, "loss_att": loss_att, "loss_ctc": loss_ctc}
@@ -120,26 +150,47 @@ class ASRModel(torch.nn.Module):
         ys_pad: torch.Tensor,
         ys_pad_lens: torch.Tensor,
     ) -> Tuple[torch.Tensor, float]:
+        """
+            计算ctc的损失函数值
+        """
+        # ys_in_pad是在每个序列的前面添加sos, 尾部用eos填充
+        # ys_out_pad是在每个序列的后面添加eos, 尾部用self.ignore_id填充
         ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos,
                                             self.ignore_id)
         ys_in_lens = ys_pad_lens + 1
 
         # reverse the seq, used for right to left decoder
+        # r_ys_pad 是对ys_pad进行翻转
         r_ys_pad = reverse_pad_list(ys_pad, ys_pad_lens, float(self.ignore_id))
+        # r_ys_in_pad是在每个翻转序列的前面添加sos,尾部用eos填充
+        # r_ys_out_pad是在每个翻转序列的后面添加eos，尾部用self.ignore_id填充
         r_ys_in_pad, r_ys_out_pad = add_sos_eos(r_ys_pad, self.sos, self.eos,
                                                 self.ignore_id)
+
+        # ys_in_pad和r_ys_in_pad是前向和反向序列
+        #  使用ys_in_pad和r_ys_in_pad双向列表计算decoder
+        #  这种情况只能在非流失的情况下效果很好
         # 1. Forward decoder
         decoder_out, r_decoder_out, _ = self.decoder(encoder_out, encoder_mask,
                                                      ys_in_pad, ys_in_lens,
                                                      r_ys_in_pad,
                                                      self.reverse_weight)
         # 2. Compute attention loss
+        #    计算attention解码的结果loss值
         loss_att = self.criterion_att(decoder_out, ys_out_pad)
+
+        # 在Transformer中，r_loss_att为0
+        # 这样可以支持流式解码
         r_loss_att = torch.tensor(0.0)
         if self.reverse_weight > 0.0:
             r_loss_att = self.criterion_att(r_decoder_out, r_ys_out_pad)
+        
+        # 计算正向loss和反向loss
+        # 得到最终的loss
         loss_att = loss_att * (
             1 - self.reverse_weight) + r_loss_att * self.reverse_weight
+        
+        # 统计符号的正确率
         acc_att = th_accuracy(
             decoder_out.view(-1, self.vocab_size),
             ys_out_pad,

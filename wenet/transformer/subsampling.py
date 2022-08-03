@@ -89,14 +89,23 @@ class Conv2dSubsampling4(BaseSubsampling):
     """
     def __init__(self, idim: int, odim: int, dropout_rate: float,
                  pos_enc_class: torch.nn.Module):
-        """Construct an Conv2dSubsampling4 object."""
+        """
+        Construct an Conv2dSubsampling4 object.
+        构建下采样，每一次运算之后的时序是原始的T/4
+        """
         super().__init__()
+        # 1. 数据压缩
+        # idim是输入的特征维度
+        # 经过下采样之后，得到的特征维度是 (((idim - 1) // 2 - 1) // 2
+        # 通道数目是odim
+        # 将所有的通道数目拼接到一起
         self.conv = torch.nn.Sequential(
             torch.nn.Conv2d(1, odim, 3, 2),
             torch.nn.ReLU(),
             torch.nn.Conv2d(odim, odim, 3, 2),
             torch.nn.ReLU(),
         )
+        # 2. 经过一次变换，将所有的通道上的特征变换到odim上的维度上，进一步压缩数据
         self.out = torch.nn.Sequential(
             torch.nn.Linear(odim * (((idim - 1) // 2 - 1) // 2), odim))
         self.pos_enc = pos_enc_class
@@ -128,8 +137,17 @@ class Conv2dSubsampling4(BaseSubsampling):
         """
         x = x.unsqueeze(1)  # (b, c=1, t, f)
         x = self.conv(x)
+        # 1. 经过下采样之后，得到的数据为
+        # batch odim, t/4, idim/4
+        # 在特征和时间的维度上都进行了下采样
         b, c, t, f = x.size()
+
+        # 2. 将通道数据和特征拼接到一起，同时将时间放在x的第二个维度上
+        # 形成 batch, time, dim
         x = self.out(x.transpose(1, 2).contiguous().view(b, t, c * f))
+
+        # 3. 对原始的数据进行位置编码
+        #    offset 提取的是x在整个序列中的偏移位置
         x, pos_emb = self.pos_enc(x, offset)
         return x, pos_emb, x_mask[:, :, :-2:2][:, :, :-2:2]
 

@@ -55,7 +55,7 @@ def subsequent_mask(
         device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
     """Create mask for subsequent steps (size, size).
-
+    这部分在流失识别中有用，处于自回归方式，当前解码中只依赖当前时刻之前的数据
     This mask is used only in decoder which works in an auto-regressive mode.
     This means the current step could only do attention with its left steps.
 

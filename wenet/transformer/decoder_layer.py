@@ -52,7 +52,7 @@ class DecoderLayer(nn.Module):
     ):
         """Construct an DecoderLayer object."""
         super().__init__()
-        self.size = size
+        self.size = size    # 这里的size表示的内部attention的维度
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
@@ -98,9 +98,11 @@ class DecoderLayer(nn.Module):
 
         """
         residual = tgt
+        # 目前的配置是norm前置
         if self.normalize_before:
             tgt = self.norm1(tgt)
-
+        
+        # 这里确定self-attention中的q
         if cache is None:
             tgt_q = tgt
             tgt_q_mask = tgt_mask
@@ -125,6 +127,7 @@ class DecoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.norm1(x)
 
+        # 第二次self-attention
         residual = x
         if self.normalize_before:
             x = self.norm2(x)
@@ -138,6 +141,7 @@ class DecoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.norm2(x)
 
+        # 最后进行feed forward network模块
         residual = x
         if self.normalize_before:
             x = self.norm3(x)
@@ -145,6 +149,7 @@ class DecoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.norm3(x)
 
+        # 输出缓存
         if cache is not None:
             x = torch.cat([cache, x], dim=1)
 

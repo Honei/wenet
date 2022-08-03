@@ -64,9 +64,13 @@ class TransformerDecoder(torch.nn.Module):
     ):
         assert check_argument_types()
         super().__init__()
+        # attention_dim是decoder内部特征的维度
+        # 如果数据量非常大的情况下，可以往大调解该数据
         attention_dim = encoder_output_size
 
         if input_layer == "embed":
+            # 对one-hot进行编码，得到attention_dim的特征
+            # 相当于对每个字进行编码
             self.embed = torch.nn.Sequential(
                 torch.nn.Embedding(vocab_size, attention_dim),
                 PositionalEncoding(attention_dim, positional_dropout_rate),
@@ -120,24 +124,46 @@ class TransformerDecoder(torch.nn.Module):
                 torch.tensor(0.0), in order to unify api with bidirectional decoder
                 olens: (batch, )
         """
+        # ys_in_pad是正向序列的目标值，结尾是eos，开始是sos
         tgt = ys_in_pad
         maxlen = tgt.size(1)
+
         # tgt_mask: (B, 1, L)
+        # tgt_mask中表示的是每个序列中有字符的位置序号
+        # 有字符的位置，值为True
+        # 没有字符的位置，值为False
         tgt_mask = ~make_pad_mask(ys_in_lens, maxlen).unsqueeze(1)
         tgt_mask = tgt_mask.to(tgt.device)
+        
         # m: (1, L, L)
+        # m 表示的是每个序列的自回归方式
+        #   自回归要求当前的字符只能依赖前面的符号，不能依赖后面的符号
+        #   例如第i个符号，只能依赖0~i-1序号的符号
+        #   那么0~i-1的值为True，其他的都为False，不能依赖
         m = subsequent_mask(tgt_mask.size(-1),
                             device=tgt_mask.device).unsqueeze(0)
+
         # tgt_mask: (B, L, L)
+        # tgt_mask 得到的是每个序列中，每个符号可以使用的符号的范围
+        # 例如：task_mask[0][0] 表示的就是序号0的序列中，序号0的字符可以用的字符范围
+        #      task_mask[0][1] 表示的是序号0的序列中，序号1的字符可以使用的字符范围
         tgt_mask = tgt_mask & m
+        
+        # 对每个建模单元进行one-hot编码映射，然后使用绝对位置编码
+        # x是原始的编码+绝对位置编码之后的向量
         x, _ = self.embed(tgt)
+        
+        # 使用decoder layer对每个向量进行处理
         for layer in self.decoders:
             x, tgt_mask, memory, memory_mask = layer(x, tgt_mask, memory,
                                                      memory_mask)
+
         if self.normalize_before:
             x = self.after_norm(x)
+
         if self.use_output_layer:
             x = self.output_layer(x)
+
         olens = tgt_mask.sum(1)
         return x, torch.tensor(0.0), olens
 

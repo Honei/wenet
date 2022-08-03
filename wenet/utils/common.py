@@ -127,9 +127,15 @@ def add_sos_eos(ys_pad: torch.Tensor, sos: int, eos: int,
                         dtype=torch.long,
                         requires_grad=False,
                         device=ys_pad.device)
+    # ys 为原始的序列数据，去掉了ignore_id的部分
     ys = [y[y != ignore_id] for y in ys_pad]  # parse padded ys
+
+    # ys_in是每个句子的开头添加了_sos符号
     ys_in = [torch.cat([_sos, y], dim=0) for y in ys]
+
+    # ys_out是每个句子的结尾添加了_eos符号
     ys_out = [torch.cat([y, _eos], dim=0) for y in ys]
+
     return pad_list(ys_in, eos), pad_list(ys_out, ignore_id)
 
 
@@ -155,6 +161,8 @@ def reverse_pad_list(ys_pad: torch.Tensor,
                 [9, 8, 0, 0]])
 
     """
+    # torch.flip(y.int()[:i], [0]) 是取出每一个序列，然后对翻转该序列
+    # 然后调用pad_sequence对该序列进行补齐，补齐的值是pad_value，默认是0
     r_ys_pad = pad_sequence([(torch.flip(y.int()[:i], [0]))
                              for y, i in zip(ys_pad, ys_lens)], True,
                             pad_value)
@@ -174,11 +182,19 @@ def th_accuracy(pad_outputs: torch.Tensor, pad_targets: torch.Tensor,
         float: Accuracy value (0.0 - 1.0).
 
     """
+    # 计算得到每个序列的结果
+    # 每个字符以最大的概率值作为目标符号
     pad_pred = pad_outputs.view(pad_targets.size(0), pad_targets.size(1),
                                 pad_outputs.size(1)).argmax(2)
+
+    # mask 表示字符的位置
     mask = pad_targets != ignore_label
+
+    # 统计预测正确的符号数目
     numerator = torch.sum(
         pad_pred.masked_select(mask) == pad_targets.masked_select(mask))
+
+    # denominator是所有符号的树木
     denominator = torch.sum(mask)
     return float(numerator) / float(denominator)
 

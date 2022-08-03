@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 class PositionalEncoding(torch.nn.Module):
     """Positional encoding.
-
+    绝对位置编码
     :param int d_model: embedding dim
     :param float dropout_rate: dropout rate
     :param int max_len: maximum input length
@@ -38,6 +38,9 @@ class PositionalEncoding(torch.nn.Module):
                  reverse: bool = False):
         """Construct an PositionalEncoding object."""
         super().__init__()
+        # 系数为 sqrt(d_model)
+        # 最大长度为5000下采样之后的语音帧
+        # 对于下采样T/4，那么最长只能支持200s的音频
         self.d_model = d_model
         self.xscale = math.sqrt(self.d_model)
         self.dropout = torch.nn.Dropout(p=dropout_rate)
@@ -70,6 +73,10 @@ class PositionalEncoding(torch.nn.Module):
 
         self.pe = self.pe.to(x.device)
         pos_emb = self.position_encoding(offset, x.size(1), False)
+        # 位置编码的方案如下：
+        # y = \alpha * x + pe
+        # pe 为位置编码
+        # \alpha为系数，目前的系数是\sqrt(d_model)
         x = x * self.xscale + pos_emb
         return self.dropout(x), self.dropout(pos_emb)
 
@@ -134,6 +141,8 @@ class RelPositionalEncoding(PositionalEncoding):
             torch.Tensor: Encoded tensor (batch, time, `*`).
             torch.Tensor: Positional embedding tensor (1, time, `*`).
         """
+        # 计算相对位置编码
+        # self.pe 中保留的是绝对位置编码的内容
         self.pe = self.pe.to(x.device)
         x = x * self.xscale
         pos_emb = self.position_encoding(offset, x.size(1), False)

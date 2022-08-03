@@ -109,14 +109,22 @@ class MultiHeadedAttention(nn.Module):
         #   1. onnx(16/-1, -1/-1, 16/0)
         #   2. jit (16/-1, -1/-1, 16/0, 16/4)
         else:
+            # 首先对scores进行softmax计算，得到归一化到[0,1]的分数
+            # attn的维度是 (batch, head, time, time)
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
-
+        
+        # 2. 对分数进行dropout处理
         p_attn = self.dropout(attn)
+
+        # 3. 将dropout之后的分数和value进行相乘，得到最后的v
         x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
+
+        # 4. 将每个Head的特征整合到一起，得到新的特征
         x = (x.transpose(1, 2).contiguous().view(n_batch, -1,
                                                  self.h * self.d_k)
              )  # (batch, time1, d_model)
 
+        # 5. 对attention之后的结果再次进行线性变换，重新整理一下特征的数据
         return self.linear_out(x)  # (batch, time1, d_model)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor,
@@ -155,6 +163,9 @@ class MultiHeadedAttention(nn.Module):
                 and `head * d_k == size`
 
         """
+        # 1. 第一步对q,k,v进行先行变换
+        #    这样q,k和v已经不是原始的q,k,v
+        #    而是分别表示query, key和value了
         q, k, v = self.forward_qkv(query, key, value)
 
         # NOTE(xcsong):
@@ -198,9 +209,11 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         """Construct an RelPositionMultiHeadedAttention object."""
         super().__init__(n_head, n_feat, dropout_rate)
         # linear transformation for positional encoding
+        # 对位置编码进行线性变换，而不是添加原始的位置编码
         self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
         # these two learnable bias are used in matrix c and matrix d
         # as described in https://arxiv.org/abs/1901.02860 Section 3.3
+        # 相对位置编码中的u和v
         self.pos_bias_u = nn.Parameter(torch.Tensor(self.h, self.d_k))
         self.pos_bias_v = nn.Parameter(torch.Tensor(self.h, self.d_k))
         torch.nn.init.xavier_uniform_(self.pos_bias_u)
@@ -256,6 +269,9 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
                 where `cache_t == chunk_size * num_decoding_left_chunks`
                 and `head * d_k == size`
         """
+        # 1. 第一步对q,k,v进行先行变换
+        #    这样q,k和v已经不是原始的q,k,v
+        #    而是分别表示query, key和value了
         q, k, v = self.forward_qkv(query, key, value)
         q = q.transpose(1, 2)  # (batch, time1, head, d_k)
 
@@ -284,8 +300,16 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         #   non-trivial to calculate `next_cache_start` here.
         new_cache = torch.cat((k, v), dim=-1)
 
+        # pos_emb shape: (1, time, dim)
         n_batch_pos = pos_emb.size(0)
+
+        # p shape: 1, time, head, d_k
         p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
+        
+        # 经过调整顺序之后，得到p的维度为： (1, head, time, d_k)
+        # 在位置编码中batch=1，对于每个batch中所有的序列，位置编码都是相同的
+        # 将head和time的位置调换之后
+        # 每一个head相当于是一个独立的序列
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
         # (batch, head, time1, d_k)
@@ -305,7 +329,8 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         # Remove rel_shift since it is useless in speech recognition,
         # and it requires special attention for streaming.
         # matrix_bd = self.rel_shift(matrix_bd)
-
+        
+        # 计算得到attention的分数
         scores = (matrix_ac + matrix_bd) / math.sqrt(
             self.d_k)  # (batch, head, time1, time2)
 

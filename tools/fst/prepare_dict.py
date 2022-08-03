@@ -8,6 +8,7 @@ import sys
 # sys.argv[3]: output lexicon file
 # sys.argv[4]: bpemodel
 
+# step1: read the language unit table file
 unit_table = set()
 with open(sys.argv[1], 'r', encoding='utf8') as fin:
     for line in fin:
@@ -27,6 +28,9 @@ if bpemode:
     import sentencepiece as spm
     sp = spm.SentencePieceProcessor()
     sp.Load(sys.argv[4])
+
+# sys.argv[2]: the original reference lexicon text file
+# sys.argv[3]: the target lexicon text file 
 lexicon_table = set()
 with open(sys.argv[2], 'r', encoding='utf8') as fin, \
         open(sys.argv[3], 'w', encoding='utf8') as fout:

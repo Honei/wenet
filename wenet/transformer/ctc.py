@@ -36,8 +36,11 @@ class CTC(torch.nn.Module):
         """
         assert check_argument_types()
         super().__init__()
+        # eprojs 表示encoder输出的维度
         eprojs = encoder_output_size
         self.dropout_rate = dropout_rate
+
+        # 使用一个线性变换，将encoder的结果映射为词典的维度
         self.ctc_lo = torch.nn.Linear(eprojs, odim)
 
         reduction_type = "sum" if reduce else "none"
@@ -54,12 +57,18 @@ class CTC(torch.nn.Module):
             ys_lens: batch of lengths of character sequence (B)
         """
         # hs_pad: (B, L, NProj) -> ys_hat: (B, L, Nvocab)
+        # 将encoder的数据转换为词典vocab_size的大小
         ys_hat = self.ctc_lo(F.dropout(hs_pad, p=self.dropout_rate))
+
         # ys_hat: (B, L, D) -> (L, B, D)
         ys_hat = ys_hat.transpose(0, 1)
         ys_hat = ys_hat.log_softmax(2)
+
+        # 最后计算ctc的loss值
         loss = self.ctc_loss(ys_hat, ys_pad, hlens, ys_lens)
+        
         # Batch-size average
+        # 计算一下batch的平均loss
         loss = loss / ys_hat.size(1)
         return loss
 

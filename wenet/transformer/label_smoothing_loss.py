@@ -82,15 +82,34 @@ class LabelSmoothingLoss(nn.Module):
         assert x.size(2) == self.size
         batch_size = x.size(0)
         x = x.view(-1, self.size)
+        # target 是一个batch上所有序列的序号
+        # 维度是 (batch*times)
         target = target.view(-1)
+
         # use zeros_like instead of torch.no_grad() for true_dist,
         # since no_grad() can not be exported by JIT
         true_dist = torch.zeros_like(x)
+        # true_dist的维度：(batch*time, vocab_size)
+
+        # 使用label smoothing
         true_dist.fill_(self.smoothing / (self.size - 1))
+        
+        # ignore的维度是(batch*times)
+        # ignore中，非padding_idx都是False
+        #            padding_idx的部分是True
         ignore = target == self.padding_idx  # (B,)
         total = len(target) - ignore.sum().item()
+        # total 是这个batch中所有的字符数目
+
+        # 将所有padding_idx的值设置为0
         target = target.masked_fill(ignore, 0)  # avoid -1 index
+        
         true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
+
+        # 最后开始计算loss值
+        # 目前loss function 使用CE
         kl = self.criterion(torch.log_softmax(x, dim=1), true_dist)
+
         denom = total if self.normalize_length else batch_size
+        # kl的维度是(batch*times, vocab_size)
         return kl.masked_fill(ignore.unsqueeze(1), 0).sum() / denom

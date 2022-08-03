@@ -18,6 +18,8 @@ import argparse
 import json
 
 if __name__ == '__main__':
+    # segments参数使用--segments形式传入
+    # wav_file, text_file和output_file是依次按照顺序传入进来
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('--segments', default=None, help='segments file')
     parser.add_argument('wav_file', help='wav file')
@@ -25,6 +27,7 @@ if __name__ == '__main__':
     parser.add_argument('output_file', help='output list file')
     args = parser.parse_args()
 
+    # 读取wav.scp内容，里面有音频的路径
     wav_table = {}
     with open(args.wav_file, 'r', encoding='utf8') as fin:
         for line in fin:
@@ -40,6 +43,11 @@ if __name__ == '__main__':
                 assert len(arr) == 4
                 segments_table[arr[0]] = (arr[1], float(arr[2]), float(arr[3]))
 
+    # 读取标注文本
+    # 最后输出的格式是一个json，有三个字段
+    # key: 音频的名称
+    # wav: 音频的绝对路径
+    # txt: 音频的标注文本
     with open(args.text_file, 'r', encoding='utf8') as fin, \
          open(args.output_file, 'w', encoding='utf8') as fout:
         for line in fin:

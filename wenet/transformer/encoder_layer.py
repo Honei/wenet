@@ -217,6 +217,7 @@ class ConformerEncoderLayer(nn.Module):
         """
 
         # whether to use macaron style
+        # 1. 第一步，首先进行reset的线性变换
         if self.feed_forward_macaron is not None:
             residual = x
             if self.normalize_before:
@@ -227,6 +228,7 @@ class ConformerEncoderLayer(nn.Module):
                 x = self.norm_ff_macaron(x)
 
         # multi-headed self-attention module
+        # 2. 第二步进行attention计算，聚合特征
         residual = x
         if self.normalize_before:
             x = self.norm_mha(x)
@@ -243,6 +245,7 @@ class ConformerEncoderLayer(nn.Module):
 
         # convolution module
         # Fake new cnn cache here, and then change it in conv_module
+        # 3. 第三步进行cnn模块计算
         new_cnn_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
         if self.conv_module is not None:
             residual = x
@@ -255,10 +258,12 @@ class ConformerEncoderLayer(nn.Module):
                 x = self.norm_conv(x)
 
         # feed forward module
+        # 4. 最后一个模块为FFN模块
         residual = x
         if self.normalize_before:
             x = self.norm_ff(x)
 
+        # 使用reset
         x = residual + self.ff_scale * self.dropout(self.feed_forward(x))
         if not self.normalize_before:
             x = self.norm_ff(x)

@@ -26,17 +26,29 @@ from wenet.transformer.encoder import (ConformerEncoder, TransformerEncoder)
 from wenet.utils.cmvn import load_cmvn
 
 def init_model(configs):
+    """
+        根据模型的配置参数初始化一个模型
+    """
+
+    # 1. 加载cmvn，并将cmvn的计算过程转换为一个网络
     if configs['cmvn_file'] is not None:
+        # load_cmvn 加载之后，是一个
         mean, istd = load_cmvn(configs['cmvn_file'], configs['is_json_cmvn'])
         global_cmvn = GlobalCMVN(
             torch.from_numpy(mean).float(),
             torch.from_numpy(istd).float())
     else:
         global_cmvn = None
-
+    
+    # 2. 确定整个ASR的输入和输出维度
+    #    输入维度目前是FBANK的梅尔滤波器数目
+    #    输出维度是词典的数目
     input_dim = configs['input_dim']
     vocab_size = configs['output_dim']
 
+    # 3. 确定encoder和decoder网络 
+    #    默认的encoder是conformer
+    #    默认的decoder是bitransformer
     encoder_type = configs.get('encoder', 'conformer')
     decoder_type = configs.get('decoder', 'bitransformer')
 
@@ -48,6 +60,8 @@ def init_model(configs):
         encoder = TransformerEncoder(input_dim,
                                      global_cmvn=global_cmvn,
                                      **configs['encoder_conf'])
+    
+    # 有decoder，使用decoder将encoder的输出转换为一个词典数目维度
     if decoder_type == 'transformer':
         decoder = TransformerDecoder(vocab_size, encoder.output_size(),
                                      **configs['decoder_conf'])
@@ -56,6 +70,8 @@ def init_model(configs):
         assert configs['decoder_conf']['r_num_blocks'] > 0
         decoder = BiTransformerDecoder(vocab_size, encoder.output_size(),
                                        **configs['decoder_conf'])
+    
+    # 3. 最后的loss function 使用 ctc
     ctc = CTC(vocab_size, encoder.output_size())
 
     # Init joint CTC/Attention or Transducer model
@@ -79,6 +95,7 @@ def init_model(configs):
                            ctc=ctc,
                            **configs['model_conf'])
     else:
+        # 默认情况下只有encoder和docoder，没有rnn
         model = ASRModel(vocab_size=vocab_size,
                          encoder=encoder,
                          decoder=decoder,

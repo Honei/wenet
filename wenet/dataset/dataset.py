@@ -31,6 +31,10 @@ class Processor(IterableDataset):
         self.kw = kw
 
     def set_epoch(self, epoch):
+        """
+            设置epoch，通过迭代调用，每个source中的sorce都会调用set_epoch
+            直到最后设置了epoch为止
+        """
         self.source.set_epoch(epoch)
 
     def __iter__(self):

@@ -23,7 +23,9 @@ from typeguard import check_argument_types
 
 
 class ConvolutionModule(nn.Module):
-    """ConvolutionModule in Conformer model."""
+    """ConvolutionModule in Conformer model.
+        这里构建的是Conformer中的CNN模块
+    """
     def __init__(self,
                  channels: int,
                  kernel_size: int = 15,
@@ -40,6 +42,9 @@ class ConvolutionModule(nn.Module):
         assert check_argument_types()
         super().__init__()
 
+        # 相当于一个线性变换
+        # 将channels维度的特征变幻到2*channels维度
+        # 使用1x1的CNN网络
         self.pointwise_conv1 = nn.Conv1d(
             channels,
             2 * channels,
@@ -106,6 +111,7 @@ class ConvolutionModule(nn.Module):
             torch.Tensor: Output tensor (#batch, time, channels).
         """
         # exchange the temporal dimension and the feature dimension
+        # 将时间和维度信息调换，这里是为了使用pointwise cnn网络
         x = x.transpose(1, 2)  # (#batch, channels, time)
 
         # mask batch padding
@@ -128,19 +134,28 @@ class ConvolutionModule(nn.Module):
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
 
         # GLU mechanism
+        # 经过point wise cnn网络之后，维度为 (batch, 2*channel, time)
         x = self.pointwise_conv1(x)  # (batch, 2*channel, dim)
         x = nn.functional.glu(x, dim=1)  # (batch, channel, dim)
 
         # 1D Depthwise Conv
+        # 讲过 depthwise变换之后，维度为：(batch, channel, time)
         x = self.depthwise_conv(x)
+
         if self.use_layer_norm:
             x = x.transpose(1, 2)
+        
+        # 默认情况下使用的是batch norm
         x = self.activation(self.norm(x))
         if self.use_layer_norm:
             x = x.transpose(1, 2)
+        
+        # 再次使用pointwise cnn，内部是linear 变换
+        # 再次进行特征变换
         x = self.pointwise_conv2(x)
         # mask batch padding
         if mask_pad.size(2) > 0:  # time > 0
             x.masked_fill_(~mask_pad, 0.0)
-
+        
+        # 最后返回的特征数据维度为： (batch, time, d_model)
         return x.transpose(1, 2), new_cache

@@ -28,7 +28,9 @@ class Executor:
 
     def train(self, model, optimizer, scheduler, data_loader, device, writer,
               args, scaler):
-        ''' Train one epoch
+        ''' 
+        Train one epoch
+        开始训练一个模型
         '''
         model.train()
         clip = args.get('grad_clip', 50.0)
@@ -51,6 +53,7 @@ class Executor:
             model_context = nullcontext
         num_seen_utts = 0
         with model_context():
+            # 遍历每一个batch数据开始处理
             for batch_idx, batch in enumerate(data_loader):
                 key, feats, target, feats_lengths, target_lengths = batch
                 feats = feats.to(device)
@@ -75,6 +78,7 @@ class Executor:
                     # The more details about amp can be found in
                     # https://pytorch.org/docs/stable/notes/amp_examples.html
                     with torch.cuda.amp.autocast(scaler is not None):
+                        # 运行数据，得到loss的值
                         loss_dict = model(feats, feats_lengths, target,
                                           target_lengths)
                         loss = loss_dict['loss'] / accum_grad
