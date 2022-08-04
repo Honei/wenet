@@ -135,6 +135,7 @@ def main():
     if len(args.override_config) > 0:
         configs = override_config(configs, args.override_config)
 
+    # 如果多卡训练，开启进行分布式训练
     distributed = args.world_size > 1
     if distributed:
         logging.info('training on multiple gpus, this gpu {}'.format(args.gpu))
@@ -143,9 +144,12 @@ def main():
                                 world_size=args.world_size,
                                 rank=args.rank)
 
+    # 加载词典
     symbol_table = read_symbol_table(args.symbol_table)
 
     train_conf = configs['dataset_conf']
+    
+    # 对于开发集的数据，不需要数据增强
     cv_conf = copy.deepcopy(train_conf)
     cv_conf['speed_perturb'] = False
     cv_conf['spec_aug'] = False
@@ -153,8 +157,10 @@ def main():
     cv_conf['shuffle'] = False
     non_lang_syms = read_non_lang_symbols(args.non_lang_syms)
 
+    # 读取训练集和开发集
     train_dataset = Dataset(args.data_type, args.train_data, symbol_table,
                             train_conf, args.bpe_model, non_lang_syms, True)
+    # 开发集不需要数据增强
     cv_dataset = Dataset(args.data_type,
                          args.cv_data,
                          symbol_table,
@@ -174,6 +180,8 @@ def main():
                                 num_workers=args.num_workers,
                                 prefetch_factor=args.prefetch)
 
+    # 获取fbank的特征数据是模型的输入维度
+    # 词典的大小是模型的输出维度
     if 'fbank_conf' in configs['dataset_conf']:
         input_dim = configs['dataset_conf']['fbank_conf']['num_mel_bins']
     else:
@@ -184,14 +192,17 @@ def main():
     configs['input_dim'] = input_dim
     configs['output_dim'] = vocab_size
     configs['cmvn_file'] = args.cmvn
-    configs['is_json_cmvn'] = True
+    # 默认情况下所有的cmvn都是json格式，不支持非json的cmvn数据
+    configs['is_json_cmvn'] = True      
     if args.rank == 0:
+        # 缓存训练的配置参数
         saved_config_path = os.path.join(args.model_dir, 'train.yaml')
         with open(saved_config_path, 'w') as fout:
             data = yaml.dump(configs)
             fout.write(data)
 
     # Init asr model from configs
+    # 根据模型的配置参数初始化一个模型
     model = init_model(configs)
     print(model)
     num_params = sum(p.numel() for p in model.parameters())
@@ -203,6 +214,8 @@ def main():
     if args.rank == 0:
         script_model = torch.jit.script(model)
         script_model.save(os.path.join(args.model_dir, 'init.zip'))
+
+    # Executor中抽象除了训练的过程
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
     if args.checkpoint is not None:
@@ -212,6 +225,8 @@ def main():
         infos = load_trained_modules(model, args)
     else:
         infos = {}
+    
+    # 读取开始的epoch信息，默认情况下epoch是从0开始的
     start_epoch = infos.get('epoch', -1) + 1
     cv_loss = infos.get('cv_loss', 0.0)
     step = infos.get('step', -1)
@@ -242,7 +257,8 @@ def main():
         use_cuda = args.gpu >= 0 and torch.cuda.is_available()
         device = torch.device('cuda' if use_cuda else 'cpu')
         model = model.to(device)
-
+    
+    # 配置优化器以及学习率衰减
     optimizer = optim.Adam(model.parameters(), **configs['optim_conf'])
     scheduler = WarmupLR(optimizer, **configs['scheduler_conf'])
     final_epoch = None
@@ -261,6 +277,7 @@ def main():
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
 
+    # 开始训练
     for epoch in range(start_epoch, num_epochs):
         train_dataset.set_epoch(epoch)
         configs['epoch'] = epoch
@@ -268,28 +285,28 @@ def main():
         logging.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
         executor.train(model, optimizer, scheduler, train_data_loader, device,
                        writer, configs, scaler)
-        total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device,
-                                                configs)
-        cv_loss = total_loss / num_seen_utts
+        # total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device,
+        #                                         configs)
+        # cv_loss = total_loss / num_seen_utts
 
-        logging.info('Epoch {} CV info cv_loss {}'.format(epoch, cv_loss))
-        if args.rank == 0:
-            save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
-            save_checkpoint(
-                model, save_model_path, {
-                    'epoch': epoch,
-                    'lr': lr,
-                    'cv_loss': cv_loss,
-                    'step': executor.step
-                })
-            writer.add_scalar('epoch/cv_loss', cv_loss, epoch)
-            writer.add_scalar('epoch/lr', lr, epoch)
-        final_epoch = epoch
+        # logging.info('Epoch {} CV info cv_loss {}'.format(epoch, cv_loss))
+        # if args.rank == 0:
+        #     save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
+        #     save_checkpoint(
+        #         model, save_model_path, {
+        #             'epoch': epoch,
+        #             'lr': lr,
+        #             'cv_loss': cv_loss,
+        #             'step': executor.step
+        #         })
+        #     writer.add_scalar('epoch/cv_loss', cv_loss, epoch)
+        #     writer.add_scalar('epoch/lr', lr, epoch)
+    #     final_epoch = epoch
 
-    if final_epoch is not None and args.rank == 0:
-        final_model_path = os.path.join(model_dir, 'final.pt')
-        os.symlink('{}.pt'.format(final_epoch), final_model_path)
-        writer.close()
+    # if final_epoch is not None and args.rank == 0:
+    #     final_model_path = os.path.join(model_dir, 'final.pt')
+    #     os.symlink('{}.pt'.format(final_epoch), final_model_path)
+    #     writer.close()
 
 
 if __name__ == '__main__':

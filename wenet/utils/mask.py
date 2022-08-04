@@ -194,7 +194,8 @@ def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
 
 def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
     """Make mask tensor containing indices of padded part.
-
+    将padding的位置设置为True，未pading的位置设置为False
+    即这个接口标记了padding的位置
     See description of make_non_pad_mask.
 
     Args:

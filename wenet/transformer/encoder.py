@@ -15,6 +15,7 @@
 # Modified from ESPnet(https://github.com/espnet/espnet)
 
 """Encoder definition."""
+import sys
 from typing import Tuple
 
 import torch
@@ -39,6 +40,9 @@ from wenet.utils.mask import add_optional_chunk_mask
 
 
 class BaseEncoder(torch.nn.Module):
+    """
+    抽象出Encoder所需要的必要参数
+    """
     def __init__(
         self,
         input_size: int,
@@ -94,6 +98,7 @@ class BaseEncoder(torch.nn.Module):
         super().__init__()
         self._output_size = output_size
 
+        # 目前只支持相对位置编码，绝对位置编码和不使用位置编码
         if pos_enc_layer_type == "abs_pos":
             pos_enc_class = PositionalEncoding
         elif pos_enc_layer_type == "rel_pos":
@@ -157,11 +162,30 @@ class BaseEncoder(torch.nn.Module):
             masks: torch.Tensor batch padding mask after subsample
                 (B, 1, T' ~= T/subsample_rate)
         """
+        # 1. T 表示本次训练时时序的长度
+        #    xs的维度是(batch, time, dim)
+        #    dim 是Fbank特征的维度,当前是80维的特征
         T = xs.size(1)
+
+        # 2. 根据时序信息，计算mask数据
+        #    xs_lens的长度是batch，保存了每个音频序列语音帧的数目
+        #    masks 标记了每个序列中有语音帧的位置
+        #    masks的维度是(batch, 1, time) time是整个batch中最长的序列
         masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
+
+        # 3. 首先进行计算cmvn
+        #    对输入的特征数据进行cmvn处理，使用全局的cmvn计算
         if self.global_cmvn is not None:
             xs = self.global_cmvn(xs)
+
+        # 4. 对数据进行下采样
+        #    下采样之后，使用下采样之后的数据进行位置编码
+        #     xs 是经过位置编码之后的特征数据，包括和位置编码相加，经过dropout
+        #     pos_emb是位置原始的位置编码
+        #     masks标记了xs中哪些位置的值是有效的
         xs, pos_emb, masks = self.embed(xs, masks)
+
+        # 5. 目前没明白chunk_masks的含义
         mask_pad = masks  # (B, 1, T/subsample_rate)
         chunk_masks = add_optional_chunk_mask(xs, masks,
                                               self.use_dynamic_chunk,
@@ -169,10 +193,15 @@ class BaseEncoder(torch.nn.Module):
                                               decoding_chunk_size,
                                               self.static_chunk_size,
                                               num_decoding_left_chunks)
+        
+        # 6. 经过每个encoder层进行处理
         for layer in self.encoders:
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
+        
         if self.normalize_before:
             xs = self.after_norm(xs)
+        
+        # 这里假设masks是没有变化的，在实际的情况中，也不应该修改masks的值
         # Here we assume the mask is not changed in encoder layers, so just
         # return the masks before encoder layers, and the masks will be used
         # for cross attention with decoder later
@@ -370,7 +399,10 @@ class TransformerEncoder(BaseEncoder):
 
 
 class ConformerEncoder(BaseEncoder):
-    """Conformer encoder module."""
+    """
+    Conformer encoder module.
+    使用 conformer 作为 encoder
+    """
     def __init__(
         self,
         input_size: int,
@@ -421,9 +453,13 @@ class ConformerEncoder(BaseEncoder):
                          input_layer, pos_enc_layer_type, normalize_before,
                          concat_after, static_chunk_size, use_dynamic_chunk,
                          global_cmvn, use_dynamic_left_chunk)
+        
+        # 1. 根据现在的激活函数类型，返回对应的激活函数
         activation = get_activation(activation_type)
 
-        # self-attention module definition
+        # 2. self-attention module definition
+        # 如果不是 rel_pos，那么使用默认的MultiHeadAttention
+        # 否则只要相对位置编码
         if pos_enc_layer_type != "rel_pos":
             encoder_selfattn_layer = MultiHeadedAttention
         else:
@@ -433,26 +469,35 @@ class ConformerEncoder(BaseEncoder):
             output_size,
             attention_dropout_rate,
         )
-        # feed-forward module definition
-        positionwise_layer = PositionwiseFeedForward
-        positionwise_layer_args = (
+        
+        # 3. feed-forward module definition
+        #    如果使用macaron模式，那么前后两个feed-forward network是相同的
+        #    在feed forward的内部维度增加
+        feedforward_layer = PositionwiseFeedForward
+        feedforward_layer_args = (
             output_size,
             linear_units,
             dropout_rate,
             activation,
         )
-        # convolution module definition
+        
+        # 4. convolution module definition
+        #    有一个卷积网络模块，并不是卷积网络
+        #    使用CNN网络搭建了一个卷积模块
         convolution_layer = ConvolutionModule
         convolution_layer_args = (output_size, cnn_module_kernel, activation,
                                   cnn_module_norm, causal)
-
+        
+        # 有多个encoder层
+        # 每一层都是相同的Conformer网络
+        # 默认使用12层网络
         self.encoders = torch.nn.ModuleList([
             ConformerEncoderLayer(
                 output_size,
                 encoder_selfattn_layer(*encoder_selfattn_layer_args),
-                positionwise_layer(*positionwise_layer_args),
-                positionwise_layer(
-                    *positionwise_layer_args) if macaron_style else None,
+                feedforward_layer(*feedforward_layer_args),
+                feedforward_layer(
+                    *feedforward_layer_args) if macaron_style else None,
                 convolution_layer(
                     *convolution_layer_args) if use_cnn_module else None,
                 dropout_rate,

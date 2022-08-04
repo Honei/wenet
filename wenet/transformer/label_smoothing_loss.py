@@ -81,9 +81,14 @@ class LabelSmoothingLoss(nn.Module):
         """
         assert x.size(2) == self.size
         batch_size = x.size(0)
+        # 原始的x的维度是：(batch, time, vocab_size)
+        # 拉平之后，维度是(batch * time, vocab_size)
+        # time 是字符的数目
         x = x.view(-1, self.size)
+
         # target 是一个batch上所有序列的序号
         # 维度是 (batch*times)
+        # times是字符的数目
         target = target.view(-1)
 
         # use zeros_like instead of torch.no_grad() for true_dist,
@@ -92,6 +97,7 @@ class LabelSmoothingLoss(nn.Module):
         # true_dist的维度：(batch*time, vocab_size)
 
         # 使用label smoothing
+        # 所有非目标的位置，设置的先验概率是 self.smoothing/(self.size-1)
         true_dist.fill_(self.smoothing / (self.size - 1))
         
         # ignore的维度是(batch*times)
@@ -104,6 +110,10 @@ class LabelSmoothingLoss(nn.Module):
         # 将所有padding_idx的值设置为0
         target = target.masked_fill(ignore, 0)  # avoid -1 index
         
+        # 通过true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
+        # 将每个序列符概率设置为对应的置信度self.confidence
+        # 例如第一个符号目标是234，那么会将[0][234]概率设置为self.confidence
+        # true_dist 的目标是为了计算 loss 值
         true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
 
         # 最后开始计算loss值
@@ -112,4 +122,5 @@ class LabelSmoothingLoss(nn.Module):
 
         denom = total if self.normalize_length else batch_size
         # kl的维度是(batch*times, vocab_size)
+        # kl.masked_fill(ignore.unsqueeze(1), 0).sum() 是对所有的数据进行求和
         return kl.masked_fill(ignore.unsqueeze(1), 0).sum() / denom

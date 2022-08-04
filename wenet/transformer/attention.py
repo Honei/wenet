@@ -39,10 +39,14 @@ class MultiHeadedAttention(nn.Module):
         # We assume d_v always equals d_k
         self.d_k = n_feat // n_head
         self.h = n_head
+        
+        # 对原始的q,k,v进行变换，变换之后计算attention结果
         self.linear_q = nn.Linear(n_feat, n_feat)
         self.linear_k = nn.Linear(n_feat, n_feat)
         self.linear_v = nn.Linear(n_feat, n_feat)
-        self.linear_out = nn.Linear(n_feat, n_feat)
+        
+        # 对attention之后的特征进行变换
+        self.linear_out = nn.Linear(n_feat, n_feat) 
         self.dropout = nn.Dropout(p=dropout_rate)
 
     def forward_qkv(
@@ -68,6 +72,7 @@ class MultiHeadedAttention(nn.Module):
         q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
         k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
         v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
+        # 这里 time2=time3, key和value的时间维度是相同的
         q = q.transpose(1, 2)  # (batch, head, time1, d_k)
         k = k.transpose(1, 2)  # (batch, head, time2, d_k)
         v = v.transpose(1, 2)  # (batch, head, time2, d_k)
@@ -97,14 +102,26 @@ class MultiHeadedAttention(nn.Module):
         # NOTE(xcsong): When will `if mask.size(2) > 0` be True?
         #   1. onnx(16/4) [WHY? Because we feed real cache & real mask for the
         #           1st chunk to ease the onnx export.]
+
+
         #   2. pytorch training
         if mask.size(2) > 0 :  # time2 > 0
+            # 这个时候mask的维度是 (batch, 1, 1, time)
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
+            # mask中标记了补全的位置
+
             # For last chunk, time2 might be larger than scores.size(-1)
+            # 对于流式处理，需要注意
             mask = mask[:, :, :, :scores.size(-1)]  # (batch, 1, *, time2)
+
+            # 将所有的补全的位置上attention分数全部设置为-inf
             scores = scores.masked_fill(mask, -float('inf'))
+
+            # 进一步将scores中补全的部分全部设置为0
+            # 每个序列中，只有有效位置上的attn值才是有效的，其他位置上的值都是无效的
             attn = torch.softmax(scores, dim=-1).masked_fill(
                 mask, 0.0)  # (batch, head, time1, time2)
+
         # NOTE(xcsong): When will `if mask.size(2) > 0` be False?
         #   1. onnx(16/-1, -1/-1, 16/0)
         #   2. jit (16/-1, -1/-1, 16/0, 16/4)
@@ -112,20 +129,24 @@ class MultiHeadedAttention(nn.Module):
             # 首先对scores进行softmax计算，得到归一化到[0,1]的分数
             # attn的维度是 (batch, head, time, time)
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
-        
+            
         # 2. 对分数进行dropout处理
         p_attn = self.dropout(attn)
 
         # 3. 将dropout之后的分数和value进行相乘，得到最后的v
-        x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
+        # p_attn的维度是(batch, head, time, time)
+        # value的维度是(batch, head, time, d_k)
+        # 最后两个维度进行矩阵相乘，得到了attention之后的向量
+        # (batch, head, time, d_k)
+        x = torch.matmul(p_attn, value)  # (batch, head, time, d_k)
 
-        # 4. 将每个Head的特征整合到一起，得到新的特征
+        # 4. 将每个head的特征整合到一起，得到新的特征
         x = (x.transpose(1, 2).contiguous().view(n_batch, -1,
                                                  self.h * self.d_k)
-             )  # (batch, time1, d_model)
+             )  # (batch, time, d_model)
 
         # 5. 对attention之后的结果再次进行线性变换，重新整理一下特征的数据
-        return self.linear_out(x)  # (batch, time1, d_model)
+        return self.linear_out(x)  # (batch, time, d_model)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor,
                 value: torch.Tensor,
@@ -166,6 +187,9 @@ class MultiHeadedAttention(nn.Module):
         # 1. 第一步对q,k,v进行先行变换
         #    这样q,k和v已经不是原始的q,k,v
         #    而是分别表示query, key和value了
+        #    q,k,v的维度是(batch, time, d_model)
+        #    在encoder中, time表示序列的长度
+        #    在decoder中, time表示标注的字符长度
         q, k, v = self.forward_qkv(query, key, value)
 
         # NOTE(xcsong):
@@ -192,7 +216,9 @@ class MultiHeadedAttention(nn.Module):
         # NOTE(xcsong): We do cache slicing in encoder.forward_chunk, since it's
         #   non-trivial to calculate `next_cache_start` here.
         new_cache = torch.cat((k, v), dim=-1)
-
+        # q,k,v的维度信息是：(batch, head, time, d_k)
+        # q,k,v都是行向量，不是列向量，因此需要k进行转置
+        # scores的维度是:(batch, head, time, time)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
         return self.forward_attention(v, scores, mask), new_cache
 
@@ -291,6 +317,7 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         # >>> torch.equal(b, c)        # True
         # >>> d = torch.split(a, 2, dim=-1)
         # >>> torch.equal(d[0], d[1])  # True
+        # 在训练的饿时候，cache的值都是为0
         if cache.size(0) > 0:
             key_cache, value_cache = torch.split(
                 cache, cache.size(-1) // 2, dim=-1)
@@ -304,27 +331,29 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         n_batch_pos = pos_emb.size(0)
 
         # p shape: 1, time, head, d_k
+        # 对位置编码进行线性变换
         p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
         
         # 经过调整顺序之后，得到p的维度为： (1, head, time, d_k)
         # 在位置编码中batch=1，对于每个batch中所有的序列，位置编码都是相同的
         # 将head和time的位置调换之后
         # 每一个head相当于是一个独立的序列
+        # 在使用相对位置编码的时候，需要依赖绝对位置编码
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
-        # (batch, head, time1, d_k)
+        # (batch, head, time, d_k)
         q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
-        # (batch, head, time1, d_k)
+        # (batch, head, time, d_k)
         q_with_bias_v = (q + self.pos_bias_v).transpose(1, 2)
 
         # compute attention score
         # first compute matrix a and matrix c
         # as described in https://arxiv.org/abs/1901.02860 Section 3.3
-        # (batch, head, time1, time2)
+        # (batch, head, time, time)
         matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
 
         # compute matrix b and matrix d
-        # (batch, head, time1, time2)
+        # (batch, head, time, time)
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
         # Remove rel_shift since it is useless in speech recognition,
         # and it requires special attention for streaming.

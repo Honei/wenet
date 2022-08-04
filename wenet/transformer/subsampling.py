@@ -108,6 +108,9 @@ class Conv2dSubsampling4(BaseSubsampling):
         # 2. 经过一次变换，将所有的通道上的特征变换到odim上的维度上，进一步压缩数据
         self.out = torch.nn.Sequential(
             torch.nn.Linear(odim * (((idim - 1) // 2 - 1) // 2), odim))
+        
+        #3. 位置编码，在下采样之后，对下采样之后的数据进行位置编码
+        #   位置编码的时序是T/4，相比下采样之前数据是原来的1/4
         self.pos_enc = pos_enc_class
         # The right context for every conv layer is computed by:
         # (kernel_size - 1) * frame_rate_of_this_layer
@@ -135,20 +138,31 @@ class Conv2dSubsampling4(BaseSubsampling):
             torch.Tensor: positional encoding
 
         """
+        # torch.nn.conv2d 接收的数据格式是(B,C,H,W)
+        # 语音特征是 (batch, time, dim)
+        # 因此添加一个通道维度Channel,变成 (batch, c=1, time, dim)
         x = x.unsqueeze(1)  # (b, c=1, t, f)
+
         x = self.conv(x)
         # 1. 经过下采样之后，得到的数据为
-        # batch odim, t/4, idim/4
+        # batch odim, (t-3)/4, (idim-3)/4
+        # 原始的80维fbank这个时候变成了19维
         # 在特征和时间的维度上都进行了下采样
         b, c, t, f = x.size()
 
         # 2. 将通道数据和特征拼接到一起，同时将时间放在x的第二个维度上
         # 形成 batch, time, dim
+        # dim的值是 odim * (idim-3)/4 的值
+        # 经过下采样之后，将80维的特征映射到了高维空间
         x = self.out(x.transpose(1, 2).contiguous().view(b, t, c * f))
 
         # 3. 对原始的数据进行位置编码
         #    offset 提取的是x在整个序列中的偏移位置
         x, pos_emb = self.pos_enc(x, offset)
+
+        # 一个conv2d下采样，经过3x3的卷积核之后，维度变换为：(T-1) // 2
+        # 因此获取的元素是比 (T/2-1），即x_mask取不到最后一个
+        # 使用slice取数据的时候，到-2即停止了，-2是间隔2个单位的最后一个数据
         return x, pos_emb, x_mask[:, :, :-2:2][:, :, :-2:2]
 
 
@@ -255,4 +269,7 @@ class Conv2dSubsampling8(BaseSubsampling):
         b, c, t, f = x.size()
         x = self.linear(x.transpose(1, 2).contiguous().view(b, t, c * f))
         x, pos_emb = self.pos_enc(x, offset)
+        # xs_mask[:,:,:-2:2][:,:-2:2] 返回x中有语音帧的位置
+        # 在x中，由于序列不等长，很多地方补0了，但是可能经过一系列运算之后，补零的位置也有值了，例如添加了偏置bias
+        # 因此需要使用x_mask标记哪些位置的值是真正有效的
         return x, pos_emb, x_mask[:, :, :-2:2][:, :, :-2:2][:, :, :-2:2]

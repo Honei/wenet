@@ -136,6 +136,7 @@ class DecoderLayer(nn.Module):
                 (x, self.src_attn(x, memory, memory, memory_mask)[0]), dim=-1)
             x = residual + self.concat_linear2(x_concat)
         else:
+            # 计算每个标注符号和encoder的输出之间attention的结果
             x = residual + self.dropout(
                 self.src_attn(x, memory, memory, memory_mask)[0])
         if not self.normalize_before:

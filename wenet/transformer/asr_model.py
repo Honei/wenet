@@ -70,7 +70,7 @@ class ASRModel(torch.nn.Module):
         self.vocab_size = vocab_size
         self.ignore_id = ignore_id
         self.ctc_weight = ctc_weight
-        self.reverse_weight = reverse_weight
+        self.reverse_weight = reverse_weight    # 反向解码的时候，反向loss权重
         
         # 确定encoder， decoder， loss function和 label smoothing loss
         # 训练过程中需要的网络部分都有了
@@ -114,7 +114,11 @@ class ASRModel(torch.nn.Module):
         #    那么每次计算时维度为(batch, times, 80)
         #    speech_lengths 表示每个音频的长度，这里长度是语音帧的数目
         #    目前encoder选择ConformerEncoder
+        #    encoder_mask的维度是(batch, 1, time)
+        #    这里的time是经过下采样之后的值，例如经过1/4的下采样，那么time=T/4，T是原始的长度
         encoder_out, encoder_mask = self.encoder(speech, speech_lengths)
+        
+        # encoder_out_lens 是每个音频语音序列的长度，维度是(batch)
         encoder_out_lens = encoder_mask.squeeze(1).sum(1)
 
         # 2a. Attention-decoder branch
@@ -152,11 +156,18 @@ class ASRModel(torch.nn.Module):
     ) -> Tuple[torch.Tensor, float]:
         """
             计算ctc的损失函数值
+            encoder_out: (batch, time, d_model) time是经过下采样之后序列的长度，d_model是attention之后的维度
+            encoder_masks: (batch, 1, time) 标记了每个序列中有效位置
         """
+
         # ys_in_pad是在每个序列的前面添加sos, 尾部用eos填充
+        # ys_in_pad是attention的输入符号
         # ys_out_pad是在每个序列的后面添加eos, 尾部用self.ignore_id填充
+        # ys_out_pad是用来用来计算loss，所有的符号以eos结尾
         ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos,
-                                            self.ignore_id)
+                                               self.ignore_id)
+
+        # ys_in_lens的长度需要添加1，每个序列都添加了一个sos符号
         ys_in_lens = ys_pad_lens + 1
 
         # reverse the seq, used for right to left decoder

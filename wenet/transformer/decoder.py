@@ -109,11 +109,11 @@ class TransformerDecoder(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward decoder.
         Args:
-            memory: encoded memory, float32  (batch, maxlen_in, feat)
-            memory_mask: encoder memory mask, (batch, 1, maxlen_in)
-            ys_in_pad: padded input token ids, int64 (batch, maxlen_out)
-            ys_in_lens: input lengths of this batch (batch)
-            r_ys_in_pad: not used in transformer decoder, in order to unify api
+            memory: encoded memory, float32  (batch, maxlen_in, feat) memory 表示的是encoder的输出特征, 维度是(batch, time, d_model)
+            memory_mask: encoder memory mask, (batch, 1, maxlen_in)   memory_mask 表示的是 encoder中有效的位置信息，维度是(batch, time)
+            ys_in_pad: padded input token ids, int64 (batch, maxlen_out)    ys_in_pad 是前向序列符号，这个序列是添加了sos和eos之后的序列, 维度是(batch, time)
+            ys_in_lens: input lengths of this batch (batch)                 ys_in_lens 是前向序列的长度，维度是(batch)
+            r_ys_in_pad: not used in transformer decoder, in order to unify api r_ys_in_pad 是反向序列符号，这个序列是原始序列翻转之后添加sos和eos之后的序列，维度是(batch, time)
                 with bidirectional decoder
             reverse_weight: not used in transformer decoder, in order to unify
                 api with bidirectional decode
@@ -125,7 +125,8 @@ class TransformerDecoder(torch.nn.Module):
                 olens: (batch, )
         """
         # ys_in_pad是正向序列的目标值，结尾是eos，开始是sos
-        tgt = ys_in_pad
+        # ys_in_pad是前向的序列，也是标注序列
+        tgt = ys_in_pad     
         maxlen = tgt.size(1)
 
         # tgt_mask: (B, 1, L)
@@ -154,16 +155,19 @@ class TransformerDecoder(torch.nn.Module):
         x, _ = self.embed(tgt)
         
         # 使用decoder layer对每个向量进行处理
+        # 使用字符的embedding和特征的embedding进行attention打分
+        # 试图得到原始的字符内容
         for layer in self.decoders:
             x, tgt_mask, memory, memory_mask = layer(x, tgt_mask, memory,
                                                      memory_mask)
 
         if self.normalize_before:
             x = self.after_norm(x)
-
+        
+        # 使用use_output_layser，将attention的内部维度映射到词典的维度
         if self.use_output_layer:
             x = self.output_layer(x)
-
+    
         olens = tgt_mask.sum(1)
         return x, torch.tensor(0.0), olens
 

@@ -128,14 +128,19 @@ def add_sos_eos(ys_pad: torch.Tensor, sos: int, eos: int,
                         requires_grad=False,
                         device=ys_pad.device)
     # ys 为原始的序列数据，去掉了ignore_id的部分
+    # 下面将ys_pad从torch.Tensor转换为一个列表
+    # 列表中每一个元素是torch.tensor，每个torch.tensor是标注文本的id，没有补全的部分
     ys = [y[y != ignore_id] for y in ys_pad]  # parse padded ys
 
     # ys_in是每个句子的开头添加了_sos符号
+    # ys_in还是一个列表
     ys_in = [torch.cat([_sos, y], dim=0) for y in ys]
 
     # ys_out是每个句子的结尾添加了_eos符号
+    # ys_out 还是一个列表，在句子的前面没有添加_sos符号
     ys_out = [torch.cat([y, _eos], dim=0) for y in ys]
-
+    
+    # pad_list(ys_in,eos) 在每个序列的前面添加了sos, 后面所有的符号都填充eos
     return pad_list(ys_in, eos), pad_list(ys_out, ignore_id)
 
 
