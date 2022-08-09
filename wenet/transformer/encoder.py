@@ -96,6 +96,8 @@ class BaseEncoder(torch.nn.Module):
         """
         assert check_argument_types()
         super().__init__()
+        # 1. output_size 是整个Encoder模块输出的维度
+        #    同时也是内部attention的维度
         self._output_size = output_size
 
         # 目前只支持相对位置编码，绝对位置编码和不使用位置编码
@@ -107,7 +109,9 @@ class BaseEncoder(torch.nn.Module):
             pos_enc_class = NoPositionalEncoding
         else:
             raise ValueError("unknown pos_enc_layer: " + pos_enc_layer_type)
-
+        
+        # 下采样层，通过下采样层可以降低后面运算量，可以对特征进行相关的变换
+        # 对时域进行下采样，时域的维度降低了
         if input_layer == "linear":
             subsampling_class = LinearNoSubsampling
         elif input_layer == "conv2d":
@@ -387,6 +391,7 @@ class TransformerEncoder(BaseEncoder):
                          input_layer, pos_enc_layer_type, normalize_before,
                          concat_after, static_chunk_size, use_dynamic_chunk,
                          global_cmvn, use_dynamic_left_chunk)
+        # 可以使用相对位置编码的attention
         self.encoders = torch.nn.ModuleList([
             TransformerEncoderLayer(
                 output_size,

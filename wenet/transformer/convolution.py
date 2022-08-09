@@ -112,6 +112,7 @@ class ConvolutionModule(nn.Module):
         """
         # exchange the temporal dimension and the feature dimension
         # 将时间和维度信息调换，这里是为了使用pointwise cnn网络
+        # 使用1维卷积的时候，需要输入的特征维度是：(N, C_in, L_in)
         x = x.transpose(1, 2)  # (#batch, channels, time)
 
         # mask batch padding

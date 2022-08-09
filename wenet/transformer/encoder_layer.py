@@ -259,6 +259,8 @@ class ConformerEncoderLayer(nn.Module):
 
         # feed forward module
         # 4. 最后一个模块为FFN模块
+        # 计算流程为：f(x) = layerNorm->linearLayer->activaton->Dropout->linearLayer->Dropout
+        #            y   = x + f(x)
         residual = x
         if self.normalize_before:
             x = self.norm_ff(x)
@@ -268,6 +270,7 @@ class ConformerEncoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.norm_ff(x)
 
+        # 最后还会使用一个layerNorm
         if self.conv_module is not None:
             x = self.norm_final(x)
 

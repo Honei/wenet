@@ -25,6 +25,7 @@ class Executor:
 
     def __init__(self):
         self.step = 0
+        self.num_epochs = 0
 
     def train(self, model, optimizer, scheduler, data_loader, device, writer,
               args, scaler):
@@ -52,6 +53,7 @@ class Executor:
         else:
             model_context = nullcontext
         num_seen_utts = 0
+        num_batches = len(data_loader)      # 统计总的batch数目
         with model_context():
             # 遍历每一个batch数据开始处理
             for batch_idx, batch in enumerate(data_loader):
@@ -90,7 +92,12 @@ class Executor:
                 num_seen_utts += num_utts
                 if batch_idx % accum_grad == 0:
                     if rank == 0 and writer is not None:
-                        writer.add_scalar('train_loss', loss, self.step)
+                        # {"loss": loss, "loss_att": loss_att, "loss_ctc": loss_ctc}
+                        loss_att = loss_dict["loss_att"]
+                        loss_ctc = loss_dict["loss_ctc"]
+                        writer.add_scalar('train_loss/train_loss', loss, self.step)
+                        writer.add_scalar("train_loss/loss_att", loss_att, self.step)
+                        writer.add_scalar("train_loss/loss_ctc", loss_ctc, self.step)
                     # Use mixed precision training
                     if use_amp:
                         scaler.unscale_(optimizer)
@@ -113,8 +120,8 @@ class Executor:
                     self.step += 1
                 if batch_idx % log_interval == 0:
                     lr = optimizer.param_groups[0]['lr']
-                    log_str = 'TRAIN Batch {}/{} loss {:.6f} '.format(
-                        epoch, batch_idx,
+                    log_str = 'TRAIN epoch: {}/{}, Batch {}/{} loss {:.6f} '.format(
+                        epoch, self.num_epochs, batch_idx, num_batches,
                         loss.item() * accum_grad)
                     for name, value in loss_dict.items():
                         if name != 'loss' and value is not None:

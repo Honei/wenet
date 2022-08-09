@@ -28,6 +28,7 @@ from wenet.utils.cmvn import load_cmvn
 def init_model(configs):
     """
         根据模型的配置参数初始化一个模型
+        该模型只支持 ctc/attention 的结构
     """
 
     # 1. 加载cmvn，并将cmvn的计算过程转换为一个网络
@@ -52,6 +53,7 @@ def init_model(configs):
     encoder_type = configs.get('encoder', 'conformer')
     decoder_type = configs.get('decoder', 'bitransformer')
 
+    # 目前 encoder 只支持 conformer和transformer这两种，其他都不支持
     if encoder_type == 'conformer':
         encoder = ConformerEncoder(input_dim,
                                    global_cmvn=global_cmvn,
@@ -62,6 +64,7 @@ def init_model(configs):
                                      **configs['encoder_conf'])
     
     # 有decoder，使用decoder将encoder的输出转换为一个词典数目维度
+    #  目前decoder的部分只支持transformer 和 bitransformer
     if decoder_type == 'transformer':
         decoder = TransformerDecoder(vocab_size, encoder.output_size(),
                                      **configs['decoder_conf'])
@@ -72,6 +75,7 @@ def init_model(configs):
                                        **configs['decoder_conf'])
     
     # 3. 最后的loss function 使用 ctc
+    #    整个模型结构只有ctc这一个loss
     ctc = CTC(vocab_size, encoder.output_size())
 
     # Init joint CTC/Attention or Transducer model
@@ -95,7 +99,8 @@ def init_model(configs):
                            ctc=ctc,
                            **configs['model_conf'])
     else:
-        # 默认情况下只有encoder和docoder，没有rnn
+        # 默认情况下只有encoder和docoder，没有rnn-t这种方式
+        # model_conf 中保留的是ctc和attention之间的关系
         model = ASRModel(vocab_size=vocab_size,
                          encoder=encoder,
                          decoder=decoder,

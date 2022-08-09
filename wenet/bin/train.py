@@ -271,6 +271,7 @@ def main():
 
     # Start training loop
     executor.step = step
+    executor.num_epochs = num_epochs
     scheduler.set_step(step)
     # used for pytorch amp mixed precision training
     scaler = None
@@ -285,28 +286,28 @@ def main():
         logging.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
         executor.train(model, optimizer, scheduler, train_data_loader, device,
                        writer, configs, scaler)
-        # total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device,
-        #                                         configs)
-        # cv_loss = total_loss / num_seen_utts
+        total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device,
+                                                configs)
+        cv_loss = total_loss / num_seen_utts
 
-        # logging.info('Epoch {} CV info cv_loss {}'.format(epoch, cv_loss))
-        # if args.rank == 0:
-        #     save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
-        #     save_checkpoint(
-        #         model, save_model_path, {
-        #             'epoch': epoch,
-        #             'lr': lr,
-        #             'cv_loss': cv_loss,
-        #             'step': executor.step
-        #         })
-        #     writer.add_scalar('epoch/cv_loss', cv_loss, epoch)
-        #     writer.add_scalar('epoch/lr', lr, epoch)
-    #     final_epoch = epoch
+        logging.info('Epoch {} CV info cv_loss {}'.format(epoch, cv_loss))
+        if args.rank == 0:
+            save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
+            save_checkpoint(
+                model, save_model_path, {
+                    'epoch': epoch,
+                    'lr': lr,
+                    'cv_loss': cv_loss,
+                    'step': executor.step
+                })
+            writer.add_scalar('epoch/cv_loss', cv_loss, epoch)
+            writer.add_scalar('epoch/lr', lr, epoch)
+        final_epoch = epoch
 
-    # if final_epoch is not None and args.rank == 0:
-    #     final_model_path = os.path.join(model_dir, 'final.pt')
-    #     os.symlink('{}.pt'.format(final_epoch), final_model_path)
-    #     writer.close()
+    if final_epoch is not None and args.rank == 0:
+        final_model_path = os.path.join(model_dir, 'final.pt')
+        os.symlink('{}.pt'.format(final_epoch), final_model_path)
+        writer.close()
 
 
 if __name__ == '__main__':
