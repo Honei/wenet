@@ -219,6 +219,8 @@ class ASRModel(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Let's assume B = batch_size
         # 1. Encoder
+        # 由于流式解码和非流式解码过程不同
+        # 因此这里将流式和非流失分开，不是直接调用forward
         if simulate_streaming and decoding_chunk_size > 0:
             encoder_out, encoder_mask = self.encoder.forward_chunk_by_chunk(
                 speech,
@@ -226,6 +228,12 @@ class ASRModel(torch.nn.Module):
                 num_decoding_left_chunks=num_decoding_left_chunks
             )  # (B, maxlen, encoder_dim)
         else:
+            # 非流失解码，直接输出encoder_out
+            # 在非流式解码中，speech_lengths的长度就是音频自身的长度
+            # 因此在解码的时候，输出的encoder_mask全部都是True
+            # 默认情况下decoding_chunk_size=-1,表示使用所有的历史数据
+            #         num_decoding_left_chunks
+            print("non streaming decoding")
             encoder_out, encoder_mask = self.encoder(
                 speech,
                 speech_lengths,
@@ -234,7 +242,7 @@ class ASRModel(torch.nn.Module):
             )  # (B, maxlen, encoder_dim)
         return encoder_out, encoder_mask
 
-    def recognize(
+    def attention_beam_search(
         self,
         speech: torch.Tensor,
         speech_lengths: torch.Tensor,
@@ -267,67 +275,143 @@ class ASRModel(torch.nn.Module):
 
         # Let's assume B = batch_size and N = beam_size
         # 1. Encoder
+        #    第一步是使用encoder计算中间的特征向量
+        #    encoder_out 的维度是(batch, times, dim)
         encoder_out, encoder_mask = self._forward_encoder(
             speech, speech_lengths, decoding_chunk_size,
             num_decoding_left_chunks,
             simulate_streaming)  # (B, maxlen, encoder_dim)
-        maxlen = encoder_out.size(1)
-        encoder_dim = encoder_out.size(2)
-        running_size = batch_size * beam_size
+        maxlen = encoder_out.size(1)        # 解码的时候，maxlen是序列的长度
+        encoder_dim = encoder_out.size(2)   # 中间特征维度
+        running_size = batch_size * beam_size   # running_size  表示扩展之后句子的数目
+
+        #    扩展beam_size个相同的encoder_out结果
+        #    由于要输出beam_size个结果，因此需要将encoder_out重复beam_size次
+        #    这样之前解码出来的每个句子hyp都有相同的当前语音帧的结果
         encoder_out = encoder_out.unsqueeze(1).repeat(1, beam_size, 1, 1).view(
             running_size, maxlen, encoder_dim)  # (B*N, maxlen, encoder_dim)
         encoder_mask = encoder_mask.unsqueeze(1).repeat(
             1, beam_size, 1, 1).view(running_size, 1,
                                      maxlen)  # (B*N, 1, max_len)
 
+        # 开始的句子里面都是填充的 <sos> 符号
+        # hyps 是所有batch的候选句子
         hyps = torch.ones([running_size, 1], dtype=torch.long,
                           device=device).fill_(self.sos)  # (B*N, 1)
+        
+        # 第一个符号的概率为0.0，概率是对数概率，
+        # 默认第0个符号的概率是1.0，即解码图的<sos>符号概率是1.0
+        # 转换为对数概率是0.0，
+        # 其他的概率都是0.0，那么对数概率是-inf
+        # scores 表示历史记录beam个句子的分数
+        # 解码开始的时候，第一个符号是<sos>，在第一次解码的时候，都是从<sos> 开始解码
+        # 只能将 beam_size 个候选位置了，任意一个设置为概率0.0，否则会导致beam search找出10个top1的句子
+        # 每个batch都要进行处理依次
         scores = torch.tensor([0.0] + [-float('inf')] * (beam_size - 1),
                               dtype=torch.float)
         scores = scores.to(device).repeat([batch_size]).unsqueeze(1).to(
             device)  # (B*N, 1)
+
+        # end_flag 用来记录解码出 <eos> 的句子数目
+        #          开始的时候，没有一个句子解码到了 <eos> 符号
         end_flag = torch.zeros_like(scores, dtype=torch.bool, device=device)
         cache: Optional[List[torch.Tensor]] = None
+        
         # 2. Decoder forward step by step
+        #    依次进行解码
+        #    beam search 解码的时候，一共有 beam 个候选句子
+        #    于此同时，每个候选句子在每一步的时候，都有 beam 个候选
         for i in range(1, maxlen + 1):
             # Stop if all batch and all beam produce eos
             if end_flag.sum() == running_size:
                 break
+            
             # 2.1 Forward decoder step
+            #     subsequent_mask(i) 返回自回归方式下，每个序列和之前序列的依赖关系
             hyps_mask = subsequent_mask(i).unsqueeze(0).repeat(
                 running_size, 1, 1).to(device)  # (B*N, i, i)
+
             # logp: (B*N, vocab)
+            # 在第一个符号<sos>输入进去之后，所有的解码结果都是相同的
+            # 使用hyps和encoder_out进行打分，得到hyps和每个encoder_out之间的分数
+            # hyps 是 batch_size * beam 个候选句子
             logp, cache = self.decoder.forward_one_step(
                 encoder_out, encoder_mask, hyps, hyps_mask, cache)
+            if i == 2:
+                print(f"hyps mask: {hyps_mask}")
+            
             # 2.2 First beam prune: select topk best prob at current time
+            #     开始解码剪枝，只选取概率最高的beam_size个结果
+            #     经过变换之后，top_k_logp 的维度是(B*N, N)
+            #     达到每个候选的句子都有的beam个候选
+            #     然后这beam候选句子会从 beam * beam 个候选中重新挑选出分数最高的 beam 个候选
+            #     作为新的 beam 个候选
             top_k_logp, top_k_index = logp.topk(beam_size)  # (B*N, N)
             top_k_logp = mask_finished_scores(top_k_logp, end_flag)
             top_k_index = mask_finished_preds(top_k_index, end_flag, self.eos)
+
             # 2.3 Second beam prune: select topk score with history
+            #     每个句子的历史分数和当前语音帧分数top_k_logp相加
+            #     得到的是添加新的符号之后，新的句子的分数
+            #     对数概率，原本是概率相乘，这时就是概率相加
+            if i == 2:
+                print(f"scores: {scores}")
+                print(f"top_k_logp: {top_k_logp}")
+                exit(0)
+            
+            # scores 是之前每个句子历史分数，每个句子输入到attention之后，得到各自的beam_size个候选
+            # scores + top_k_logp 这样，beam_size 每个句子都重新有 beam_size 个候选，
+            # 需要重新在 beam_size*beam_size 中挑选出新的 beam_size 个候选
             scores = scores + top_k_logp  # (B*N, N), broadcast add
+
+            #  展开之后，每个句子是有N*N个新的候选
+            #  每个句子下N*N个新的候选中重新挑选出N个候选
             scores = scores.view(batch_size, beam_size * beam_size)  # (B, N*N)
+            
+            # 每个句子从 beam_size * beam_size 里面挑选beam_size个分数最高的符号概率
+            # offset_k_index是在N*N中的候选的序号
             scores, offset_k_index = scores.topk(k=beam_size)  # (B, N)
+
+            # 每个句子中选取最大的分数作为新的beam个句子
             scores = scores.view(-1, 1)  # (B*N, 1)
+
             # 2.4. Compute base index in top_k_index,
             # regard top_k_index as (B*N*N),regard offset_k_index as (B*N),
             # then find offset_k_index in top_k_index
+            # base_k_index 是每个候选句子 batch 的索引
+            # batch 中每个句子有 beam_size * beam_size 个新的候选
+            # 每个句子是在 beam_size * beam_size 个候选中挑选出 beam_size 个候选
             base_k_index = torch.arange(batch_size, device=device).view(
                 -1, 1).repeat([1, beam_size])  # (B, N)
+            
+            # 因此 base_k_index * beam_size * beam_size 
+            # 是每个句子新挑选出句子时，在 batch * beam_size * beam_size 所有句子中的基础偏移
+            # 例如：batch 中第一个候选句子基础偏移是0
+            #      batch 中第二个句子基础偏移是 1 * beam_size * beam_size, 前 beam_size * beam_size 是属于第一个句子的
             base_k_index = base_k_index * beam_size * beam_size
+
+            # best_k_index + offset_k_index 这样就得到了每个句子绝对位置的偏移
             best_k_index = base_k_index.view(-1) + offset_k_index.view(
                 -1)  # (B*N)
 
             # 2.5 Update best hyps
+            #     解码得到最后的句子
+            #     在 top_k_index中挑选出序号是 besk_k_index 的那些位置内容
             best_k_pred = torch.index_select(top_k_index.view(-1),
                                              dim=-1,
                                              index=best_k_index)  # (B*N)
+            
+            # best_hyps_index得到的是原始beam_size个候选句子的序号
             best_hyps_index = best_k_index // beam_size
+            # 通过 best_hyps_index 获取上次的候选句子内容last_best_k_hyps
+            # 将 last_best_k_hyps 和当前选出来的解码单元 best_k_pred 合并在一起就是新的beam_size个候选句子
             last_best_k_hyps = torch.index_select(
                 hyps, dim=0, index=best_hyps_index)  # (B*N, i)
             hyps = torch.cat((last_best_k_hyps, best_k_pred.view(-1, 1)),
                              dim=1)  # (B*N, i+1)
 
             # 2.6 Update end flag
+            # 更新end_flag，判断解码出来的句子中，哪一个句子解码得到了eos
             end_flag = torch.eq(hyps[:, -1], self.eos).view(-1, 1)
 
         # 3. Select best of best
@@ -349,7 +433,7 @@ class ASRModel(torch.nn.Module):
         simulate_streaming: bool = False,
     ) -> List[List[int]]:
         """ Apply CTC greedy search
-
+            CTC的贪婪解码，是最简单的解码方式
         Args:
             speech (torch.Tensor): (batch, max_len, feat_dim)
             speech_length (torch.Tensor): (batch, )
@@ -366,20 +450,41 @@ class ASRModel(torch.nn.Module):
         """
         assert speech.shape[0] == speech_lengths.shape[0]
         assert decoding_chunk_size != 0
+        # speech的维度是:(batch, times, feat_dim)
+        # speech_lengths的维度是:(batch), 只有一个常量，常量的值就是batch的数目
+        # 在解码阶段，batch_size 通常是1
         batch_size = speech.shape[0]
+
         # Let's assume B = batch_size
+        # 1. 经过encoder推理之后，得到一个新的特征数据
+        #    维度信息是(batch, times, encoder_dim)
+        #    encoder_dim是encoder内部attention的维度
         encoder_out, encoder_mask = self._forward_encoder(
             speech, speech_lengths, decoding_chunk_size,
             num_decoding_left_chunks,
             simulate_streaming)  # (B, maxlen, encoder_dim)
+
+        # 2. 进行贪婪解码
+        #   在解码阶段，encoder_mask全部都是True
+        #   encoder_mask的维度是：(1, 1, times)
+        #   encoder_out_lens 和 maxlen 是相同的
         maxlen = encoder_out.size(1)
         encoder_out_lens = encoder_mask.squeeze(1).sum(1)
+  
+        # 3. 根据encoder内部解码的信息，计算ctc的概率
         ctc_probs = self.ctc.log_softmax(
             encoder_out)  # (B, maxlen, vocab_size)
+        
+        # 4. 直接选取每个时间序列上的概率最大值，作为每个时间的实际输出结果
         topk_prob, topk_index = ctc_probs.topk(1, dim=2)  # (B, maxlen, 1)
+        # topk_index 是每个语音帧上概率最大的序号,也是最后的解码结果
+        # topk_index 的维度是(B, maxlen, 1)
         topk_index = topk_index.view(batch_size, maxlen)  # (B, maxlen)
         mask = make_pad_mask(encoder_out_lens, maxlen)  # (B, maxlen)
+        # 将所有补零的地方设置为eos, 在解码的时候，没有位置是eos
         topk_index = topk_index.masked_fill_(mask, self.eos)  # (B, maxlen)
+        
+        # 5. 解码结果通常只有1个
         hyps = [hyp.tolist() for hyp in topk_index]
         scores = topk_prob.max(1)
         hyps = [remove_duplicates_and_blank(hyp) for hyp in hyps]
@@ -395,7 +500,7 @@ class ASRModel(torch.nn.Module):
         simulate_streaming: bool = False,
     ) -> Tuple[List[List[int]], torch.Tensor]:
         """ CTC prefix beam search inner implementation
-
+            ctc 的beam search 解码方式
         Args:
             speech (torch.Tensor): (batch, max_len, feat_dim)
             speech_length (torch.Tensor): (batch, )
@@ -416,23 +521,33 @@ class ASRModel(torch.nn.Module):
         assert speech.shape[0] == speech_lengths.shape[0]
         assert decoding_chunk_size != 0
         batch_size = speech.shape[0]
+        # 在解码的时候，只有一个音频同时解码
         # For CTC prefix beam search, we only support batch_size=1
         assert batch_size == 1
         # Let's assume B = batch_size and N = beam_size
         # 1. Encoder forward and get CTC score
+        #    通常是非流式解码，直接输出encoder_out
+        #    encoder_out的维度信息是(batch, times, attn_dim)
         encoder_out, encoder_mask = self._forward_encoder(
             speech, speech_lengths, decoding_chunk_size,
             num_decoding_left_chunks,
             simulate_streaming)  # (B, maxlen, encoder_dim)
+        
+        # self.ctc.log_softmax的部分是原始ctc中的内容
+        # 在计算log_softmax的时候，ctc里面没有使用dropout
         maxlen = encoder_out.size(1)
         ctc_probs = self.ctc.log_softmax(
             encoder_out)  # (1, maxlen, vocab_size)
         ctc_probs = ctc_probs.squeeze(0)
+        
         # cur_hyps: (prefix, (blank_ending_score, none_blank_ending_score))
         cur_hyps = [(tuple(), (0.0, -float('inf')))]
         # 2. CTC beam search step by step
+        #    进行ctc解码, ctc解码是动态规划的方法
         for t in range(0, maxlen):
+            # 取出当前语音帧的概率，这一帧数据包括所有符号的概率
             logp = ctc_probs[t]  # (vocab_size,)
+            
             # key: prefix, value (pb, pnb), default value(-inf, -inf)
             next_hyps = defaultdict(lambda: (-float('inf'), -float('inf')))
             # 2.1 First beam prune: select topk best
@@ -541,9 +656,13 @@ class ASRModel(torch.nn.Module):
             assert hasattr(self.decoder, 'right_decoder')
         device = speech.device
         batch_size = speech.shape[0]
+        print("device: {}".format(device))
+        print("batch size: {}".format(batch_size))
+   
         # For attention rescoring we only support batch_size=1
         assert batch_size == 1
         # encoder_out: (1, maxlen, encoder_dim), len(hyps) = beam_size
+        # encoder_dim 是内部attention的维度
         hyps, encoder_out = self._ctc_prefix_beam_search(
             speech, speech_lengths, beam_size, decoding_chunk_size,
             num_decoding_left_chunks, simulate_streaming)
@@ -565,7 +684,10 @@ class ASRModel(torch.nn.Module):
                                   encoder_out.size(1),
                                   dtype=torch.bool,
                                   device=device)
+        
         # used for right to left decoder
+        # 使用解码出来的句子，和原始的内部特征进行attention计算
+        # 得到新的decoder_out解码
         r_hyps_pad = reverse_pad_list(ori_hyps_pad, hyps_lens, self.ignore_id)
         r_hyps_pad, _ = add_sos_eos(r_hyps_pad, self.sos, self.eos,
                                     self.ignore_id)
@@ -578,7 +700,9 @@ class ASRModel(torch.nn.Module):
         # conventional transformer decoder.
         r_decoder_out = torch.nn.functional.log_softmax(r_decoder_out, dim=-1)
         r_decoder_out = r_decoder_out.cpu().numpy()
+        
         # Only use decoder score for rescoring
+        # 每个句子和自身的特征进行attention打分，得到新的分数
         best_score = -float('inf')
         best_index = 0
         for i, hyp in enumerate(hyps):

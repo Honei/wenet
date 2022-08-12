@@ -53,7 +53,7 @@ class Executor:
         else:
             model_context = nullcontext
         num_seen_utts = 0
-        num_batches = len(data_loader)      # 统计总的batch数目
+        # num_batches = len(data_loader)      # 统计总的batch数目
         with model_context():
             # 遍历每一个batch数据开始处理
             for batch_idx, batch in enumerate(data_loader):
@@ -120,8 +120,8 @@ class Executor:
                     self.step += 1
                 if batch_idx % log_interval == 0:
                     lr = optimizer.param_groups[0]['lr']
-                    log_str = 'TRAIN epoch: {}/{}, Batch {}/{} loss {:.6f} '.format(
-                        epoch, self.num_epochs, batch_idx, num_batches,
+                    log_str = 'TRAIN epoch: {}/{}, Batch {} loss {:.6f} '.format(
+                        epoch, self.num_epochs, batch_idx,
                         loss.item() * accum_grad)
                     for name, value in loss_dict.items():
                         if name != 'loss' and value is not None:

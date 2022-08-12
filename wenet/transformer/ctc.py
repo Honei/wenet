@@ -80,6 +80,8 @@ class CTC(torch.nn.Module):
         Returns:
             torch.Tensor: log softmax applied 3d tensor (B, Tmax, odim)
         """
+        # 这里为什么没有使用dropout进行处理
+        # 如果使用dropout是不是会不一样
         return F.log_softmax(self.ctc_lo(hs_pad), dim=2)
 
     def argmax(self, hs_pad: torch.Tensor) -> torch.Tensor:

@@ -233,6 +233,7 @@ def get_subsample(config):
 
 
 def remove_duplicates_and_blank(hyp: List[int]) -> List[int]:
+    # 去掉重复的符号和空格
     new_hyp: List[int] = []
     cur = 0
     while cur < len(hyp):

@@ -109,6 +109,7 @@ def get_args():
 
 
 def main():
+    # 1. 解析命令行的参数
     args = get_args()
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
@@ -126,9 +127,11 @@ def main():
     if len(args.override_config) > 0:
         configs = override_config(configs, args.override_config)
 
+    # 加载词典
     symbol_table = read_symbol_table(args.dict)
     test_conf = copy.deepcopy(configs['dataset_conf'])
 
+    # 设置特征提取部分参数
     test_conf['filter_conf']['max_length'] = 102400
     test_conf['filter_conf']['min_length'] = 0
     test_conf['filter_conf']['token_max_length'] = 102400
@@ -148,6 +151,7 @@ def main():
     test_conf['batch_conf']['batch_size'] = args.batch_size
     non_lang_syms = read_non_lang_symbols(args.non_lang_syms)
 
+    # 加载数据集
     test_dataset = Dataset(args.data_type,
                            args.test_data,
                            symbol_table,
@@ -159,19 +163,24 @@ def main():
     test_data_loader = DataLoader(test_dataset, batch_size=None, num_workers=0)
 
     # Init asr model from configs
+    # 初始化模型
     model = init_model(configs)
 
     # Load dict
     char_dict = {v: k for k, v in symbol_table.items()}
     eos = len(char_dict) - 1
 
+    # 加载模型
     load_checkpoint(model, args.checkpoint)
     use_cuda = args.gpu >= 0 and torch.cuda.is_available()
     device = torch.device('cuda' if use_cuda else 'cpu')
     model = model.to(device)
 
+    # 设置为eval模式，避免train模式一些问题
+    print (f"args.mode: {args.mode}")
     model.eval()
     with torch.no_grad(), open(args.result_file, 'w') as fout:
+        # 依次读取每一个batch的数据
         for batch_idx, batch in enumerate(test_data_loader):
             keys, feats, target, feats_lengths, target_lengths = batch
             feats = feats.to(device)
@@ -179,7 +188,7 @@ def main():
             feats_lengths = feats_lengths.to(device)
             target_lengths = target_lengths.to(device)
             if args.mode == 'attention':
-                hyps, _ = model.recognize(
+                hyps, _ = model.attention_beam_search(
                     feats,
                     feats_lengths,
                     beam_size=args.beam_size,
@@ -188,6 +197,8 @@ def main():
                     simulate_streaming=args.simulate_streaming)
                 hyps = [hyp.tolist() for hyp in hyps]
             elif args.mode == 'ctc_greedy_search':
+                # ctc greedy search 是最简单的解码算法
+                # 直接使用贪婪算法，每个语音帧只输出最有的建模单元
                 hyps, _ = model.ctc_greedy_search(
                     feats,
                     feats_lengths,
@@ -207,6 +218,7 @@ def main():
             # result in List[int], change it to List[List[int]] for compatible
             # with other batch decoding mode
             elif args.mode == 'ctc_prefix_beam_search':
+                # 使用 beam search 进行解码
                 assert (feats.size(0) == 1)
                 hyp, _ = model.ctc_prefix_beam_search(
                     feats,
