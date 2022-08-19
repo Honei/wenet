@@ -205,11 +205,19 @@ class TransformerDecoder(torch.nn.Module):
                                                        memory,
                                                        memory_mask,
                                                        cache=c)
+            
+            # 缓存new_cache中保留的是多次筛选出的整个句子的语义信息
+            # 这里记录的是每一层网络的缓存
+            # 在解码下一帧语音信息的时候，使用前一个时间解码出来的缓存信息
             new_cache.append(x)
+        
+        # 使用最后一个序列的向量用来预测当前的符号
         if self.normalize_before:
             y = self.after_norm(x[:, -1])
         else:
             y = x[:, -1]
+
+        # 将最后一个向量转换为建模单元的对数概率
         if self.use_output_layer:
             y = torch.log_softmax(self.output_layer(y), dim=-1)
         return y, new_cache

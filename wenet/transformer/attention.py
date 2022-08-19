@@ -106,12 +106,13 @@ class MultiHeadedAttention(nn.Module):
 
         #   2. pytorch training
         if mask.size(2) > 0 :  # time2 > 0
-            # 这个时候mask的维度是 (batch, 1, 1, time)
+            # 这个时候mask的维度是 (batch, 1, 1, time2)
+            # time2 表示key 和 value的长度，即使用多少个value生成一个新的值
+             # mask中标记了补全的位置，未来补全的位置的分数设置为0
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
-            # mask中标记了补全的位置
-
+           
             # For last chunk, time2 might be larger than scores.size(-1)
-            # 对于流式处理，需要注意
+            # 对于流式处理，需要注意，确保scores中计算出来的分数个数和mask中的个数是相同的
             mask = mask[:, :, :, :scores.size(-1)]  # (batch, 1, *, time2)
 
             # 将所有的补全的位置上attention分数全部设置为-inf
@@ -128,6 +129,7 @@ class MultiHeadedAttention(nn.Module):
         else:
             # 首先对scores进行softmax计算，得到归一化到[0,1]的分数
             # attn的维度是 (batch, head, time, time)
+            # 这个时候，默认是没有补零的情况
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
             
         # 2. 对分数进行dropout处理

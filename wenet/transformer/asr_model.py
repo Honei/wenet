@@ -233,7 +233,6 @@ class ASRModel(torch.nn.Module):
             # 因此在解码的时候，输出的encoder_mask全部都是True
             # 默认情况下decoding_chunk_size=-1,表示使用所有的历史数据
             #         num_decoding_left_chunks
-            print("non streaming decoding")
             encoder_out, encoder_mask = self.encoder(
                 speech,
                 speech_lengths,
@@ -277,17 +276,18 @@ class ASRModel(torch.nn.Module):
         # 1. Encoder
         #    第一步是使用encoder计算中间的特征向量
         #    encoder_out 的维度是(batch, times, dim)
+        #    encoder_out 相当于降采样之后的(h_1, h_2, ..., h_{U})
         encoder_out, encoder_mask = self._forward_encoder(
             speech, speech_lengths, decoding_chunk_size,
             num_decoding_left_chunks,
             simulate_streaming)  # (B, maxlen, encoder_dim)
         maxlen = encoder_out.size(1)        # 解码的时候，maxlen是序列的长度
         encoder_dim = encoder_out.size(2)   # 中间特征维度
-        running_size = batch_size * beam_size   # running_size  表示扩展之后句子的数目
 
         #    扩展beam_size个相同的encoder_out结果
         #    由于要输出beam_size个结果，因此需要将encoder_out重复beam_size次
         #    这样之前解码出来的每个句子hyp都有相同的当前语音帧的结果
+        running_size = batch_size * beam_size   # running_size  表示扩展之后句子的数目
         encoder_out = encoder_out.unsqueeze(1).repeat(1, beam_size, 1, 1).view(
             running_size, maxlen, encoder_dim)  # (B*N, maxlen, encoder_dim)
         encoder_mask = encoder_mask.unsqueeze(1).repeat(
@@ -315,6 +315,10 @@ class ASRModel(torch.nn.Module):
         # end_flag 用来记录解码出 <eos> 的句子数目
         #          开始的时候，没有一个句子解码到了 <eos> 符号
         end_flag = torch.zeros_like(scores, dtype=torch.bool, device=device)
+        # cache 中记录的是历史解码单元的内容
+        # cache 是一个列表，列表中每个元素是decoder中每一层的历史信息
+        # 这样使用self.decoder.forward_one_step 进行解码时，利用了所有已经解码出来的数据
+        # 这也会导致，随着音频的增长，解码一帧数据需要的时间会变的很长
         cache: Optional[List[torch.Tensor]] = None
         
         # 2. Decoder forward step by step
@@ -335,10 +339,12 @@ class ASRModel(torch.nn.Module):
             # 在第一个符号<sos>输入进去之后，所有的解码结果都是相同的
             # 使用hyps和encoder_out进行打分，得到hyps和每个encoder_out之间的分数
             # hyps 是 batch_size * beam 个候选句子
+            # cache 中记录的是历史解码单元的内容
+            # cache 是一个列表，列表中每个元素是decoder中每一层的历史信息
+            # 这样使用self.decoder.forward_one_step 进行解码时，利用了所有已经解码出来的数据
+            # 这也会导致，随着音频的增长，解码一帧数据需要的时间会变的很长
             logp, cache = self.decoder.forward_one_step(
                 encoder_out, encoder_mask, hyps, hyps_mask, cache)
-            if i == 2:
-                print(f"hyps mask: {hyps_mask}")
             
             # 2.2 First beam prune: select topk best prob at current time
             #     开始解码剪枝，只选取概率最高的beam_size个结果
@@ -354,10 +360,6 @@ class ASRModel(torch.nn.Module):
             #     每个句子的历史分数和当前语音帧分数top_k_logp相加
             #     得到的是添加新的符号之后，新的句子的分数
             #     对数概率，原本是概率相乘，这时就是概率相加
-            if i == 2:
-                print(f"scores: {scores}")
-                print(f"top_k_logp: {top_k_logp}")
-                exit(0)
             
             # scores 是之前每个句子历史分数，每个句子输入到attention之后，得到各自的beam_size个候选
             # scores + top_k_logp 这样，beam_size 每个句子都重新有 beam_size 个候选，

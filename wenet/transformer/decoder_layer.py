@@ -97,6 +97,11 @@ class DecoderLayer(nn.Module):
             torch.Tensor: Encoded memory mask (#batch, maxlen_in).
 
         """
+        # 在attention的算法中，解码时tgt表示的含义是：
+        # y_1, y_2, ..., y_{i-1}
+        # 表示之前解码的i-1个符号
+        # 训练的时候， tgt 表示的是答案
+        # y_1, y_2, ..., y_{T}
         residual = tgt
         # 目前的配置是norm前置
         if self.normalize_before:
@@ -104,6 +109,7 @@ class DecoderLayer(nn.Module):
         
         # 这里确定self-attention中的q
         if cache is None:
+            # 这种情况都是在第一帧数据的时候，这个时候 tgt_mask 只有一个时间点
             tgt_q = tgt
             tgt_q_mask = tgt_mask
         else:
@@ -113,15 +119,20 @@ class DecoderLayer(nn.Module):
                 tgt.shape[1] - 1,
                 self.size,
             ), "{cache.shape} == {(tgt.shape[0], tgt.shape[1] - 1, self.size)}"
+            # 如果有了缓存，我们只计算最后一个时间片段的结果
+            # 这里自回归的结果中，不需要其他的时间点的结果
+            # 在当前的模型结构中，自回归的数据，前面的结果使用的是前面时刻解码出来的缓存内容
             tgt_q = tgt[:, -1:, :]
             residual = residual[:, -1:, :]
             tgt_q_mask = tgt_mask[:, -1:, :]
 
+        # 这个时候，在每一个decoder_layer中，根据句子语义信息以及特征数据，计算得到最后一个时间点上的特征数据
         if self.concat_after:
             tgt_concat = torch.cat(
                 (tgt_q, self.self_attn(tgt_q, tgt, tgt, tgt_q_mask)[0]), dim=-1)
             x = residual + self.concat_linear1(tgt_concat)
         else:
+            # 经过 self_attn，相当于预测出来的符号之间进行atten，可以理解为获取整句话的语义信息
             x = residual + self.dropout(
                 self.self_attn(tgt_q, tgt, tgt, tgt_q_mask)[0])
         if not self.normalize_before:
@@ -141,7 +152,7 @@ class DecoderLayer(nn.Module):
                 self.src_attn(x, memory, memory, memory_mask)[0])
         if not self.normalize_before:
             x = self.norm2(x)
-
+        
         # 最后进行feed forward network模块
         residual = x
         if self.normalize_before:
@@ -150,7 +161,8 @@ class DecoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.norm3(x)
 
-        # 输出缓存
+        # 输出缓存, cache中保存了之前解码出来的内容
+        # 合并cache之后，保证time维度是不变的
         if cache is not None:
             x = torch.cat([cache, x], dim=1)
 
