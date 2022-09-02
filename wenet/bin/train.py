@@ -136,6 +136,7 @@ def main():
         configs = override_config(configs, args.override_config)
 
     # 如果多卡训练，开启进行分布式训练
+    # args.world_size 确定是整个训练过程中GPU卡的数目
     distributed = args.world_size > 1
     if distributed:
         logging.info('training on multiple gpus, this gpu {}'.format(args.gpu))

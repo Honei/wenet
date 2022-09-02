@@ -216,8 +216,11 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
                              max_len,
                              dtype=torch.int64,
                              device=lengths.device)
+    # 经过 expand 之后是 (batch, max_len)
     seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
     seq_length_expand = lengths.unsqueeze(-1)
+
+    # mask 相当于标记了每个序列中pad的位置
     mask = seq_range_expand >= seq_length_expand
     return mask
 
