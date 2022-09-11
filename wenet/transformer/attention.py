@@ -92,7 +92,8 @@ class MultiHeadedAttention(nn.Module):
                 (#batch, n_head, time1, time2).
             mask (torch.Tensor): Mask, size (#batch, 1, time2) or
                 (#batch, time1, time2), (0, 0, 0) means fake mask.
-
+                1. 在非流式encoder的self_attn时，mask的维度是(batch, 1, times)
+                   其中 times 表示音频的语音帧的长度，有降采样时，表示降采样之后的音频序列长度
         Returns:
             torch.Tensor: Transformed value (#batch, time1, d_model)
                 weighted by the attention score (#batch, time1, time2).
@@ -106,20 +107,23 @@ class MultiHeadedAttention(nn.Module):
 
         #   2. pytorch training
         if mask.size(2) > 0 :  # time2 > 0
-            # 这个时候mask的维度是 (batch, 1, 1, time2)
+            # 在非流式模式下，mask的维度是 (batch, 1, 1, time2)
             # time2 表示key 和 value的长度，即使用多少个value生成一个新的值
-             # mask中标记了补全的位置，未来补全的位置的分数设置为0
+            # mask中标记了补全的位置，未来补全的位置的分数设置为0
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
            
             # For last chunk, time2 might be larger than scores.size(-1)
             # 对于流式处理，需要注意，确保scores中计算出来的分数个数和mask中的个数是相同的
+            # 在非流式情况下，通过torch.tensor的广播能力，对每一个序列进行打分进行mask处理
+            # 将不在每个序列长度之内的分数设置为-inf
             mask = mask[:, :, :, :scores.size(-1)]  # (batch, 1, *, time2)
-
             # 将所有的补全的位置上attention分数全部设置为-inf
             scores = scores.masked_fill(mask, -float('inf'))
 
             # 进一步将scores中补全的部分全部设置为0
             # 每个序列中，只有有效位置上的attn值才是有效的，其他位置上的值都是无效的
+            # -inf 位置上的值经过softmax之后实际上是变成了0
+            # 这里重新根据mask的值将序列之外的分数设置为0
             attn = torch.softmax(scores, dim=-1).masked_fill(
                 mask, 0.0)  # (batch, head, time1, time2)
 

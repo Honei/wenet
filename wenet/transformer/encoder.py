@@ -187,9 +187,12 @@ class BaseEncoder(torch.nn.Module):
         #     xs 是经过位置编码之后的特征数据，包括和位置编码相加，经过dropout
         #     pos_emb是位置原始的位置编码
         #     masks标记了xs中哪些位置的值是有效的
+        
         xs, pos_emb, masks = self.embed(xs, masks)
-
         # 5. 目前没明白chunk_masks的含义
+        #    在非流式情况下，chunk_masks = masks
+        #    维度是(batch, 1, U)
+        #    其中 U 是下采样之后语音序列的长度
         mask_pad = masks  # (B, 1, T/subsample_rate)
         chunk_masks = add_optional_chunk_mask(xs, masks,
                                               self.use_dynamic_chunk,
@@ -197,7 +200,7 @@ class BaseEncoder(torch.nn.Module):
                                               decoding_chunk_size,
                                               self.static_chunk_size,
                                               num_decoding_left_chunks)
-        
+
         # 6. 经过每个encoder层进行处理
         for layer in self.encoders:
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
