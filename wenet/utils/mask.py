@@ -113,6 +113,7 @@ def subsequent_chunk_mask(
          [1, 1, 1, 1],
          [1, 1, 1, 1]]
     """
+    # subsequent_chunk_mask 方法用于创建一个固定大小chunk的mask。
     ret = torch.zeros(size, size, device=device, dtype=torch.bool)
     for i in range(size):
         if num_left_chunks < 0:
@@ -135,6 +136,7 @@ def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
         xs (torch.Tensor): padded input, (B, L, D), L for max length
         mask (torch.Tensor): mask for xs, (B, 1, L)
         use_dynamic_chunk (bool): whether to use dynamic chunk or not
+                                  流式解码的时候使用动态chunk
         use_dynamic_left_chunk (bool): whether to use dynamic left chunk for
             training.
         decoding_chunk_size (int): decoding chunk size for dynamic chunk, it's
@@ -153,8 +155,17 @@ def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
         torch.Tensor: chunk mask of the input xs.
     """
     # Whether to use chunk mask or not
+    # use_dynamic_chunk=Ture, 各的batch使用随机的chunk mask。
+    #   如果 use_dynamic_left_chunk=True， 各的 batch 使用随机的的left chunk长度依赖
+    #   如果 use_dynamic_left_chunk=False， 各的 batch 使用均依赖开头到当前chunk
+    # use_dynamic_chunk = false, static_chunk_size <= 0. 使用full-attention.
+    # use_dynamic_chunk = false, static_chunk_size > 0. 使用固定的chunk mask.
     if use_dynamic_chunk:
-        max_len = xs.size(1)
+        max_len = xs.size(1)   # 这是一个batch中最大的音频长度
+        # decoding_chunk_size 是在解码的时候，需要的chunk的大小
+        # 0: 训练的时候使用，表示随机chunk大小
+        # <0: 表示使用整个音频
+        # >0: 解码时需要指定的chunk大小
         if decoding_chunk_size < 0:
             chunk_size = max_len
             num_left_chunks = -1
@@ -165,6 +176,22 @@ def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
             # chunk size is either [1, 25] or full context(max_len).
             # Since we use 4 times subsampling and allow up to 1s(100 frames)
             # delay, the maximum frame is 100 / 4 = 25.
+            # 使用随机chunk进行训练
+            # 在wenet中提出了dynamic chunk的训练机制，
+            # 在训练过程中，每一个 batch 都使用 dynamic_chunk_size 进行训练，
+            # 换句话说，每一个 batch 所使用的 chunk_size 是不同的，是动态变化的。
+
+            # 记当前 batch 的最大的序列长度为L，
+            # 而 dynamic_chunk_size 在1到该batch的最大序列长度L的范围内随机取值，
+            # 如果随机值大于 L/2，则将chunk size的值取为L，
+            # 如果随机值小于或者等于 L/2，则chunk size从[1,25]的范围内随机取值。
+            # 如chunk_size取值为 batch 中最大序列长度 L，
+            # 则表明使用全部上下文注意，这种则作为非流式训练的组成部分；
+            # 而另一种将chunk_size取值为[1,25]，
+            # 则表示使用部分上下文注意，这种取值方式则作为流式训练的组成部分。
+
+            # 使用最大25，是因为在流式ASR中，25帧对应的时间是1s，
+            # 超过1s，流式会有很强的延时感觉
             chunk_size = torch.randint(1, max_len, (1, )).item()
             num_left_chunks = -1
             if chunk_size > max_len // 2:
@@ -181,6 +208,8 @@ def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
         chunk_masks = chunk_masks.unsqueeze(0)  # (1, L, L)
         chunk_masks = masks & chunk_masks  # (B, L, L)
     elif static_chunk_size > 0:
+        # 使用固定大小的chunk_size进行训练，
+        # 解码的时候也是使用固定大小的chunk_size进行解码
         num_left_chunks = num_decoding_left_chunks
         chunk_masks = subsequent_chunk_mask(xs.size(1), static_chunk_size,
                                             num_left_chunks,
@@ -189,6 +218,7 @@ def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
         chunk_masks = masks & chunk_masks  # (B, L, L)
     else:
         chunk_masks = masks
+        
     return chunk_masks
 
 

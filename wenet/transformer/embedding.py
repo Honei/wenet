@@ -80,7 +80,9 @@ class PositionalEncoding(torch.nn.Module):
         x = x * self.xscale + pos_emb
         return self.dropout(x), self.dropout(pos_emb)
 
-    def position_encoding(self, offset: Union[int, torch.Tensor], size: int,
+    def position_encoding(self, 
+                          offset: Union[int, torch.Tensor], 
+                          size: int,
                           apply_dropout: bool = True) -> torch.Tensor:
         """ For getting encoding in a streaming fashion
 
@@ -89,7 +91,8 @@ class PositionalEncoding(torch.nn.Module):
         streaming way, but will call this function several times with
         increasing input size in a streaming scenario, so the dropout will
         be applied several times.
-
+        在非流式解码的时候，dropout只会使用一次
+        在流式解码的时候，每个解码的chunk都会使用一次
         Args:
             offset (int or torch.tensor): start offset
             size (int): requried size of position encoding
@@ -101,6 +104,7 @@ class PositionalEncoding(torch.nn.Module):
         #   https://github.com/pytorch/pytorch/issues/69434
         if isinstance(offset, int):
             assert offset + size < self.max_len
+            # 取出该chunk数据真实的位置编码信息
             pos_emb = self.pe[:, offset:offset + size]
         elif isinstance(offset, torch.Tensor) and offset.dim() == 0:  # scalar
             assert offset + size < self.max_len
@@ -137,6 +141,8 @@ class RelPositionalEncoding(PositionalEncoding):
         """Compute positional encoding.
         Args:
             x (torch.Tensor): Input tensor (batch, time, `*`).
+            offset: (int, torch.Tensor): 该语音片段在整个语音中的位置偏移
+                                即该语音片段在整个语音中真正的起始位置
         Returns:
             torch.Tensor: Encoded tensor (batch, time, `*`).
             torch.Tensor: Positional embedding tensor (1, time, `*`).
@@ -145,6 +151,7 @@ class RelPositionalEncoding(PositionalEncoding):
         # self.pe 中保留的是绝对位置编码的内容
         self.pe = self.pe.to(x.device)
         x = x * self.xscale
+        # 根据该chunk的在音频中的真实位置，取出位置编码
         pos_emb = self.position_encoding(offset, x.size(1), False)
         return self.dropout(x), self.dropout(pos_emb)
 

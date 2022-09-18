@@ -19,6 +19,7 @@
 from typing import Tuple, Union
 
 import torch
+import time
 
 
 class BaseSubsampling(torch.nn.Module):
@@ -129,7 +130,8 @@ class Conv2dSubsampling4(BaseSubsampling):
         Args:
             x (torch.Tensor): Input tensor (#batch, time, idim).
             x_mask (torch.Tensor): Input mask (#batch, 1, time).
-
+            offset: (int, torch.Tensor): 该语音片段在整个语音中的位置偏移
+                                          即该语音片段在整个语音中真正的起始位置
         Returns:
             torch.Tensor: Subsampled tensor (#batch, time', odim),
                 where time' = time // 4.
@@ -141,15 +143,18 @@ class Conv2dSubsampling4(BaseSubsampling):
         # torch.nn.conv2d 接收的数据格式是(B,C,H,W)
         # 语音特征是 (batch, time, dim)
         # 因此添加一个通道维度Channel,变成 (batch, c=1, time, dim)
+        # 第一个chunk在这里执行的时候，时间比较长
+        # 因此使用python计算得到的rtf不一定正确
         x = x.unsqueeze(1)  # (b, c=1, t, f)
-
+        # start_second = time.time()
         x = self.conv(x)
+        # print(f"subsampling embedding elapsed time: {time.time() - start_second}")
+
         # 1. 经过下采样之后，得到的数据为
         # batch odim, (t-3)/4, (idim-3)/4
         # 原始的80维fbank这个时候变成了19维
         # 在特征和时间的维度上都进行了下采样
         b, c, t, f = x.size()
-
         # 2. 将通道数据和特征拼接到一起，同时将时间放在x的第二个维度上
         # 形成 batch, time, dim
         # dim的值是 odim * (idim-3)/4 的值

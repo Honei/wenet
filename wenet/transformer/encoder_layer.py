@@ -204,6 +204,7 @@ class ConformerEncoderLayer(nn.Module):
                 for ConformerEncoderLayer.
             mask_pad (torch.Tensor): batch padding mask used for conv module.
                 (#batch, 1，time), (0, 0, 0) means fake mask.
+                表示原始序列中pad补齐的信息
             att_cache (torch.Tensor): Cache tensor of the KEY & VALUE
                 (#batch=1, head, cache_t1, d_k * 2), head * d_k == size.
             cnn_cache (torch.Tensor): Convolution cache in conformer layer
@@ -246,6 +247,7 @@ class ConformerEncoderLayer(nn.Module):
         # convolution module
         # Fake new cnn cache here, and then change it in conv_module
         # 3. 第三步进行cnn模块计算
+        #    在训练的时候，不需要缓存信息，可以看到整个音频特征数据
         new_cnn_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
         if self.conv_module is not None:
             residual = x
@@ -273,5 +275,8 @@ class ConformerEncoderLayer(nn.Module):
         # 最后还会使用一个layerNorm
         if self.conv_module is not None:
             x = self.norm_final(x)
-
+        # 训练的时候，不需要缓存信息
+        # 训练的时候，获取到的是整个音频，拿到了整个音频信息
+        # 流式推理的时候，由于拿到的不是完整的音频，因此在推理的时候
+        # 需要之前的音频信息，需要缓存信息
         return x, mask, new_att_cache, new_cnn_cache

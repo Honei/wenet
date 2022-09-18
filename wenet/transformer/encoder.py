@@ -37,8 +37,8 @@ from wenet.transformer.subsampling import LinearNoSubsampling
 from wenet.utils.common import get_activation
 from wenet.utils.mask import make_pad_mask
 from wenet.utils.mask import add_optional_chunk_mask
-
-
+import time
+from datetime import datetime
 class BaseEncoder(torch.nn.Module):
     """
     抽象出Encoder所需要的必要参数
@@ -153,6 +153,8 @@ class BaseEncoder(torch.nn.Module):
             xs: padded input tensor (B, T, D)
             xs_lens: input length (B)
             decoding_chunk_size: decoding chunk size for dynamic chunk
+                在动态chunk解码的时候，解码每一帧时需要的chunk的大小
+                0: 在训练的时候使用
                 0: default for training, use random dynamic chunk.
                 <0: for decoding, use full chunk.
                 >0: for decoding, use fixed chunk size as set.
@@ -191,8 +193,10 @@ class BaseEncoder(torch.nn.Module):
         xs, pos_emb, masks = self.embed(xs, masks)
         # 5. 目前没明白chunk_masks的含义
         #    在非流式情况下，chunk_masks = masks
-        #    维度是(batch, 1, U)
+        #    masks 的维度是 (B, 1, U)
+        #    B 是 batch_size
         #    其中 U 是下采样之后语音序列的长度
+        #    U 是 经过下采样之后，序列的长度
         mask_pad = masks  # (B, 1, T/subsample_rate)
         chunk_masks = add_optional_chunk_mask(xs, masks,
                                               self.use_dynamic_chunk,
@@ -200,7 +204,7 @@ class BaseEncoder(torch.nn.Module):
                                               decoding_chunk_size,
                                               self.static_chunk_size,
                                               num_decoding_left_chunks)
-
+                                              
         # 6. 经过每个encoder层进行处理
         for layer in self.encoders:
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
@@ -253,33 +257,53 @@ class BaseEncoder(torch.nn.Module):
                 same shape as the original cnn_cache.
 
         """
+        start_second = time.time()
         assert xs.size(0) == 1
         # tmp_masks is just for interface compatibility
+        # 在推理的时候，bacth_size = 1, 没有padding，所有语音帧都是有用的
         tmp_masks = torch.ones(1,
                                xs.size(1),
                                device=xs.device,
                                dtype=torch.bool)
         tmp_masks = tmp_masks.unsqueeze(1)
+        # tmp_masks shape is : (b=1, 1, time)
         if self.global_cmvn is not None:
             xs = self.global_cmvn(xs)
         # NOTE(xcsong): Before embed, shape(xs) is (b=1, time, mel-dim)
+        # self.embed在第一次解码的时候，执行的时间非常长
         xs, pos_emb, _ = self.embed(xs, tmp_masks, offset)
         # NOTE(xcsong): After  embed, shape(xs) is (b=1, chunk_size, hidden-dim)
+
+        # att_cache 的维度是 (elayers, head, cache_t1, d_k * 2)
+        # elayers:  encoder block的树木
+        # cache_t1: cache的时间长度 
+        # print(f"chunk xs size: {xs.size()}")
         elayers, cache_t1 = att_cache.size(0), att_cache.size(2)
         chunk_size = xs.size(1)
-        attention_key_size = cache_t1 + chunk_size
+        attention_key_size = cache_t1 + chunk_size  # 得到 key 的长度，即记忆的长度
+
+        # 此时对 新的 attnetion 的 key 进行编码
+        # offset - cache_t1 是从cache的offset 位置
         pos_emb = self.embed.position_encoding(
             offset=offset - cache_t1, size=attention_key_size)
+        
+        # 记录下一个cache的开始位置
         if required_cache_size < 0:
             next_cache_start = 0
         elif required_cache_size == 0:
             next_cache_start = attention_key_size
         else:
             next_cache_start = max(attention_key_size - required_cache_size, 0)
+        
+        # print(f"attention_key_size: {attention_key_size}")
+        # print(f"required_cache_size: {required_cache_size}")
+        # print(f"next_cache_start: {next_cache_start}")
         r_att_cache = []
         r_cnn_cache = []
         for i, layer in enumerate(self.encoders):
             # NOTE(xcsong): Before layer.forward
+            #   att_cache 是一个 torch.Tensor
+            #   cnn_cache 是一个 List
             #   shape(att_cache[i:i + 1]) is (1, head, cache_t1, d_k * 2),
             #   shape(cnn_cache[i])       is (b=1, hidden-dim, cache_t2)
             xs, _, new_att_cache, new_cnn_cache = layer(
@@ -340,16 +364,37 @@ class BaseEncoder(torch.nn.Module):
         assert self.static_chunk_size > 0 or self.use_dynamic_chunk
         subsampling = self.embed.subsampling_rate
         context = self.embed.right_context + 1  # Add current frame
+        
+        # 计算当前 chunk 数据所需要的语音帧数据
+        # stride 表示每一次 chunk 推理的时候，移动的语音帧数目
+        # decoding_window 表示每一次 chunk 推理的时候，整体需要的语音帧数目
         stride = subsampling * decoding_chunk_size
         decoding_window = (decoding_chunk_size - 1) * subsampling + context
         num_frames = xs.size(1)
-        att_cache: torch.Tensor = torch.zeros((0, 0, 0, 0), device=xs.device)
+
+        # 缓存初始都是0 
+        att_cache: torch.Tensor = torch.zeros((0, 0, 0, 0), device=xs.device)       
         cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0), device=xs.device)
         outputs = []
         offset = 0
+
+        # 计算需要的缓存数目，这是解码当前chunk数据时，需要的历史信息
+        # 在计算一个chunk的时候，同时需要 num_decoding_left_chunks 个历史 chunk 共同来决定当前chunk的结果
+        # 在这里 chunk 表示解码块 decoding_chunk_size
+        # 因此缓存需要的是 num_decoding_left_chunks 个 decoding_chunk_size 的数据
+        # 或者之前解码过的次数数据
         required_cache_size = decoding_chunk_size * num_decoding_left_chunks
+        # print(f"required cache size: {required_cache_size}")
 
         # Feed forward overlap input step by step
+        # 这里确保最后一个 chunk 有足够的数据
+        # 计算的数目为 (num_frames - context) / stride + 1 = (num_frames - context + stride) / stride
+        # 因此这里最后添加的应该是 num_frames - context + stride
+        # 这里使用 num_frames - context + 1，这样经过最后一个不足以 window 长度之后，
+        # 不会有两个 chunk 不超过 window
+        # 最后也是经过 (num_frames - context) / stride + 1 次计算
+        # num_frames - context + 1 = num_frames - (context - 1) = nums_frames - self.embed.right_context
+        # 这样可以确保至少有一个 chunk 的数据
         for cur in range(0, num_frames - context + 1, stride):
             end = min(cur + decoding_window, num_frames)
             chunk_xs = xs[:, cur:end, :]
@@ -357,6 +402,8 @@ class BaseEncoder(torch.nn.Module):
                 chunk_xs, offset, required_cache_size, att_cache, cnn_cache)
             outputs.append(y)
             offset += y.size(1)
+            # print(f"cur: {cur}, end: {end}")
+
         ys = torch.cat(outputs, 1)
         masks = torch.ones((1, 1, ys.size(1)), device=ys.device, dtype=torch.bool)
         return ys, masks

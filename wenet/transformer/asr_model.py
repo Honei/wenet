@@ -29,7 +29,7 @@ from wenet.utils.common import (IGNORE_ID, add_sos_eos, log_add,
                                 reverse_pad_list)
 from wenet.utils.mask import (make_pad_mask, mask_finished_preds,
                               mask_finished_scores, subsequent_mask)
-
+import time
 
 # ASRModel 的详细解释参见: https://zhuanlan.zhihu.com/p/381095506?utm_source=wechat_session&utm_medium=social&utm_oi=34522477363200
 class ASRModel(torch.nn.Module):
@@ -48,6 +48,7 @@ class ASRModel(torch.nn.Module):
         reverse_weight: float = 0.0,
         lsm_weight: float = 0.0,
         length_normalized_loss: bool = False,
+        num_decoding_left_chunks: int = -1,
     ):
         """
             vocab_size: 表示词典
@@ -60,6 +61,7 @@ class ASRModel(torch.nn.Module):
             lsm_weight: 在decoder中，使用label smoothing技术时，label smothing的值
             length_normalized_loss: 对decoder最后的loss进行归一化时，使用batch_size归一化还是使用有效字符的长度进行归一化
                                     设置为True时，表示使用有效字符的长度进行归一化
+            num_left_chunk_size: 计算每个chunk的数据时，包括当前chunk在内一共需要多个chunk块
         """
         assert 0.0 <= ctc_weight <= 1.0, ctc_weight
 
@@ -72,7 +74,8 @@ class ASRModel(torch.nn.Module):
         self.ignore_id = ignore_id
         self.ctc_weight = ctc_weight
         self.reverse_weight = reverse_weight    # 反向解码的时候，反向loss权重
-        
+        self.num_decoding_left_chunks = num_decoding_left_chunks
+
         # 确定encoder， decoder， loss function和 label smoothing loss
         # 训练过程中需要的网络部分都有了
         # 目前encoder选择ConformerEncoder
@@ -117,7 +120,9 @@ class ASRModel(torch.nn.Module):
         #    目前 encoder 选择 ConformerEncoder
         #    encoder_mask 的维度是(batch, 1, time)
         #    这里的time是经过下采样之后的值，例如经过1/4的下采样，那么time=T/4，T是原始的长度
-        encoder_out, encoder_mask = self.encoder(speech, speech_lengths)
+        encoder_out, encoder_mask = self.encoder(speech, 
+                                                 speech_lengths,
+                                                 num_decoding_left_chunks=self.num_decoding_left_chunks)
         
         # encoder_out_lens 是每个音频语音序列的长度，维度是(batch)
         encoder_out_lens = encoder_mask.squeeze(1).sum(1)
@@ -222,6 +227,8 @@ class ASRModel(torch.nn.Module):
         # 1. Encoder
         # 由于流式解码和非流式解码过程不同
         # 因此这里将流式和非流失分开，不是直接调用forward
+        # print(f"streaming: {simulate_streaming}")
+        # print(f"decoding_chunk_size: {decoding_chunk_size}")
         if simulate_streaming and decoding_chunk_size > 0:
             encoder_out, encoder_mask = self.encoder.forward_chunk_by_chunk(
                 speech,
@@ -240,6 +247,7 @@ class ASRModel(torch.nn.Module):
                 decoding_chunk_size=decoding_chunk_size,
                 num_decoding_left_chunks=num_decoding_left_chunks
             )  # (B, maxlen, encoder_dim)
+        # print(f"encoder elapsed time: {time.time() - start_second}")
         return encoder_out, encoder_mask
 
     def attention_beam_search(

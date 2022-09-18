@@ -117,6 +117,7 @@ class MultiHeadedAttention(nn.Module):
             # 在非流式情况下，通过torch.tensor的广播能力，对每一个序列进行打分进行mask处理
             # 将不在每个序列长度之内的分数设置为-inf
             mask = mask[:, :, :, :scores.size(-1)]  # (batch, 1, *, time2)
+
             # 将所有的补全的位置上attention分数全部设置为-inf
             scores = scores.masked_fill(mask, -float('inf'))
 
@@ -277,7 +278,8 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
 
         return x
 
-    def forward(self, query: torch.Tensor,
+    def forward(self, 
+                query: torch.Tensor,
                 key: torch.Tensor, value: torch.Tensor,
                 mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
                 pos_emb: torch.Tensor = torch.empty(0),
@@ -301,8 +303,8 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
                 where `cache_t == chunk_size * num_decoding_left_chunks`
                 and `head * d_k == size`
         """
-        # 1. 第一步对q,k,v进行先行变换
-        #    这样q,k和v已经不是原始的q,k,v
+        # 1. 第一步对 q, k, v进行先行变换
+        #    这样 q, k 和 v 已经不是原始的 q, k, v
         #    而是分别表示query, key和value了
         q, k, v = self.forward_qkv(query, key, value)
         q = q.transpose(1, 2)  # (batch, time1, head, d_k)
@@ -323,14 +325,29 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         # >>> torch.equal(b, c)        # True
         # >>> d = torch.split(a, 2, dim=-1)
         # >>> torch.equal(d[0], d[1])  # True
-        # 在训练的饿时候，cache的值都是为0
+        # 在训练的时候，cache的值都是为0
+        # 在流式推理的时候，cache.size > 0
+        # print(f"attn cache size: {cache.size()}")
         if cache.size(0) > 0:
+            # 沿着最后一个维度，将数据进行分为两个tensor
+            # 例如原始的 cache 的维度是(1, 4, 53, 128)
+            # 使用 cache.size(-1) // 2 = 64, dim=-1 进行split 之后，得到两个 tensor 
+            # 每一个维度信息未: (1, 4, 53, 64)
+            # 因此经过 split 之后，可以获得 cache 中的 key 和 value
             key_cache, value_cache = torch.split(
                 cache, cache.size(-1) // 2, dim=-1)
+
+            # 将缓存的key, value 以及当前 chunk 的 key, value 拼接起来
+            # 使用 cache 的原因是，计算当前的符号的 attention，
+            # 不仅仅和当前的数据有关，也和历史的数据有关
+            # 相当于看了一些历史信息
             k = torch.cat([key_cache, k], dim=2)
             v = torch.cat([value_cache, v], dim=2)
+
         # NOTE(xcsong): We do cache slicing in encoder.forward_chunk, since it's
         #   non-trivial to calculate `next_cache_start` here.
+        #   将 key 和 value 放在一个 torch.Tensor 中传出去
+        #   这里的 key 和 value 是历史缓存 cache 和 当前 chunk 总的数据
         new_cache = torch.cat((k, v), dim=-1)
 
         # pos_emb shape: (1, time, dim)
