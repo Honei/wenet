@@ -11,13 +11,17 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3"
 # communication. More details can be found in
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
 # export NCCL_SOCKET_IFNAME=ens4f1
+# export NCCL_SOCKET_IFNAME=xgbe0,xgbe1,lo,en,eth,em,bond,ens4f1
+export NCCL_SOCKET_IFNAME=xgbe,en,eth,em,bond,ens4f1
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export TORCH_SHOW_CPP_STACKTRACES=1
 export NCCL_DEBUG=INFO
-stage=7 # start from 0 if you need to start from data preparation
-stop_stage=7
+stage=4 # start from 0 if you need to start from data preparation
+stop_stage=4
 
 # The num of machines(nodes) for multi-machine training, 1 is for one machine.
 # NFS is required if num_nodes > 1.
-num_nodes=1
+num_nodes=2
 
 # The rank of each node or machine, which ranges from 0 to `num_nodes - 1`.
 # You should set the node_rank=0 on the first machine, set the node_rank=1
@@ -31,18 +35,7 @@ data_url=www.openslr.org/resources/33
 # 使用 tensorboard 看信息
 # tensorboard --logdir ./log/  --port 8200 --bind_all
 
-# function get_nj()
-# {
-#     cpu_num=`lscpu | grep "^CPU(s)" | awk -F":" '{print $2}' | awk '{print $NF}'`
-#     spk_num=`cat $1 | awk '{print $1}' | sort | uniq | wc -l`
-#     min_val=$cpu_num
-#     if [ $min_val -gt $spk_num ];then
-#         min_val=$spk_num
-#     fi
-#     echo $min_val
-# }
-function get_nj()
-{
+function get_nj() {
     cpu_num=`lscpu | grep "^CPU(s)" | awk -F":" '{print $2}' | awk '{print $NF}'`
     spk_num=`cat $1 | awk '{print $1}' | sort | uniq | wc -l`
     min_val=$cpu_num
@@ -63,16 +56,17 @@ num_utts_per_shard=1000
 train_set=train
 # Optional train_config
 # 1. conf/train_transformer.yaml: Standard transformer
-# 2. conf/train_conformer.yaml: Standard conformer
+# 2. conf/train_conformer.yaml: Standard conformer 效果最好，非流式，但是随着音频变长，RTF 会非常大，RTF 不是一个固定值
 # 3. conf/train_unified_conformer.yaml: Unified dynamic chunk causal conformer
 # 4. conf/train_unified_transformer.yaml: Unified dynamic chunk transformer
 # 5. conf/train_u2++_conformer.yaml: U2++ conformer
 # 6. conf/train_u2++_transformer.yaml: U2++ transformer
-train_config=conf/train_unified_conformer.yaml
+# train_config=conf/exp_train_unified_conformer.yaml
+train_config=conf/train_u2++_conformer.yaml
 cmvn=true
 # dir=exp/conformer
 # dir=exp/conformer_20220805
-dir=exp/conformer_20220810
+dir=exp/conformer_20220921
 # dir=exp/demo/
 # checkpoint=exp/conformer/79.pt
 # checkpoint=
@@ -80,8 +74,8 @@ dir=exp/conformer_20220810
 average_checkpoint=true
 decode_checkpoint=$dir/final.pt
 average_num=30
-decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
-# decode_modes="attention_rescoring"
+# decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
+decode_modes="attention_rescoring"
 . tools/parse_options.sh || exit 1;
 
 if [ ${stage} -le -1 ] && [ ${stop_stage} -ge -1 ]; then
@@ -218,7 +212,7 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   # non-streaming model. The default value is -1, which is full chunk
   # for non-streaming inference.
   # 默认情况下是非流式服务
-  decoding_chunk_size=
+  decoding_chunk_size=16
   ctc_weight=0.5
   reverse_weight=0.0
   for mode in ${decode_modes}; do
@@ -234,6 +228,8 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
       --beam_size 10 \
       --batch_size 1 \
       --penalty 0.0 \
+      --num_decoding_left_chunks 1 \
+      --simulate_streaming \
       --dict $dict \
       --ctc_weight $ctc_weight \
       --reverse_weight $reverse_weight \

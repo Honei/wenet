@@ -257,7 +257,7 @@ class BaseEncoder(torch.nn.Module):
                 same shape as the original cnn_cache.
 
         """
-        start_second = time.time()
+        # start_second = time.time()
         assert xs.size(0) == 1
         # tmp_masks is just for interface compatibility
         # 在推理的时候，bacth_size = 1, 没有padding，所有语音帧都是有用的
@@ -293,6 +293,7 @@ class BaseEncoder(torch.nn.Module):
         elif required_cache_size == 0:
             next_cache_start = attention_key_size
         else:
+            # 预留 required_cache_size 的数据用于下一个chunk进行缓存
             next_cache_start = max(attention_key_size - required_cache_size, 0)
         
         # print(f"attention_key_size: {attention_key_size}")
