@@ -1,6 +1,6 @@
 # Performance Record
 
-## Conformer Result
+## Conformer Result 非流式
 
 * Feature info: using fbank feature, dither, cmvn, online speed perturb
 * Training info: lr 0.002, batch size 18, 4 gpu, acc_grad 4, 240 epochs, dither 0.1
@@ -17,7 +17,7 @@
 
 ## U2++ Conformer Result
 
-* Feature info: using fbank feature, dither=1.0, cmvn, oneline speed perturb
+* Feature info: using fbank feature, dither=1.0, cmvn, online speed perturb
 * Training info: lr 0.001, batch size 16, 8 gpu, acc_grad 1, 360 epochs
 * Decoding info: ctc_weight 0.3, reverse_weight 0.5  average_num 30
 * Git hash: 5a1342312668e7a5abb83aed1e53256819cebf95
@@ -29,9 +29,26 @@
 | attention rescoring       | 4.63  | 5.05  |
 | LM + attention rescoring  | 4.40  | 4.75  |
 
+* ctc_weight=0.5, reverse_weight=0.0
+
+| num_left_chunk_size   | -1    | 0     | 1    | 2   | 3  |
+|---------------------------|-------|-------|------|-----| ---|
+| attention rescoring       | 5.21 | 9.05   | 6.63  |5.95|5.72|
+
+
+* ctc_weight=0.3, reverse_weight=0.5
+
+| num_left_chunk_size   | -1    | 0     | 1    | 2   | 3  |
+|---------------------------|-------|-------|------|-----| ---|
+| attention rescoring       | 5.09 |  8.70 | 6.46   |5.82|5.56|
+
+* conf/exp_train_u2++_conformer.yaml
+* 使用静态chunk_size训练，num_left_chunk_size=3 cer=5.15，比原始的效果相对降低10%
+* 使用该模型 avg_30
+
 ## Unified Conformer Result
 
-* Feature info: using fbank feature, dither=0, cmvn, oneline speed perturb
+* Feature info: using fbank feature, dither=0, cmvn, online speed perturb
 * Training info: lr 0.001, batch size 16, 8 gpu, acc_grad 1, 180 epochs, dither 0.0
 * Decoding info: ctc_weight 0.5, average_num 20
 * Git hash: 919f07c4887ac500168ba84b39b535fd8e58918a

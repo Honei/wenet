@@ -8,37 +8,39 @@ encoder_conf:
     num_blocks: 12      # the number of encoder blocks
     dropout_rate: 0.1
     positional_dropout_rate: 0.1
-    attention_dropout_rate: 0.0
+    attention_dropout_rate: 0.1
     input_layer: conv2d # encoder input type, you can chose conv2d, conv2d6 and conv2d8
     normalize_before: true
-    cnn_module_kernel: 15
+    cnn_module_kernel: 8
     use_cnn_module: True
     activation_type: 'swish'
     pos_enc_layer_type: 'rel_pos'
     selfattention_layer_type: 'rel_selfattn'
     causal: true
-    use_dynamic_chunk: false # 流式训练使用固定的chunk
+    use_dynamic_chunk: false
     cnn_module_norm: 'layer_norm' # using nn.LayerNorm makes model converge faster
     use_dynamic_left_chunk: false
     static_chunk_size: 16
 
 # decoder related
-decoder: transformer
+decoder: bitransformer
 decoder_conf:
     attention_heads: 4
     linear_units: 2048
-    num_blocks: 6
+    num_blocks: 3
+    r_num_blocks: 3
     dropout_rate: 0.1
     positional_dropout_rate: 0.1
-    self_attention_dropout_rate: 0.0
-    src_attention_dropout_rate: 0.0
+    self_attention_dropout_rate: 0.1
+    src_attention_dropout_rate: 0.1
 
 # hybrid CTC/attention
 model_conf:
     ctc_weight: 0.3
     lsm_weight: 0.1     # label smoothing option
     length_normalized_loss: false
-    num_decoding_left_chunks: 1
+    reverse_weight: 0.3
+    num_decoding_left_chunks: 3
 
 dataset_conf:
     filter_conf:
@@ -53,13 +55,17 @@ dataset_conf:
         num_mel_bins: 80
         frame_shift: 10
         frame_length: 25
-        dither: 0.1
+        dither: 1.0
     spec_aug: true
     spec_aug_conf:
         num_t_mask: 2
         num_f_mask: 2
         max_t: 50
         max_f: 10
+    spec_sub: true
+    spec_sub_conf:
+        num_t_sub: 3
+        max_t: 30
     shuffle: true
     shuffle_conf:
         shuffle_size: 1500
@@ -72,7 +78,7 @@ dataset_conf:
 
 grad_clip: 5
 accum_grad: 1
-max_epoch: 280
+max_epoch: 360
 log_interval: 100
 
 optim: adam
