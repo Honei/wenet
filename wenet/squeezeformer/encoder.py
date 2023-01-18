@@ -113,6 +113,7 @@ class SqueezeformerEncoder(nn.Module):
         self.static_chunk_size = static_chunk_size
         self.use_dynamic_chunk = use_dynamic_chunk
         self.use_dynamic_left_chunk = use_dynamic_left_chunk
+        self.pos_enc_layer_type = pos_enc_layer_type
         activation = get_activation(activation_type)
 
         # self-attention module definition
@@ -215,7 +216,7 @@ class SqueezeformerEncoder(nn.Module):
                                               decoding_chunk_size,
                                               self.static_chunk_size,
                                               num_decoding_left_chunks)
-        xs_lens = chunk_masks.squeeze(1).sum(1)
+        xs_lens = mask_pad.squeeze(1).sum(1)
         xs = self.preln(xs)
         recover_activations: \
             List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
@@ -236,13 +237,14 @@ class SqueezeformerEncoder(nn.Module):
                      recover_pos_emb, recover_mask_pad) \
                         = recover_activations[index]
                     # recover output length for ctc decode
-                    xs = torch.repeat_interleave(xs, repeats=2, dim=1)
+                    xs = xs.unsqueeze(2).repeat(1, 1, 2, 1).flatten(1, 2)
                     xs = self.time_recover_layer(xs)
                     recoverd_t = recover_tensor.size(1)
                     xs = recover_tensor + xs[:, :recoverd_t, :].contiguous()
                     chunk_masks = recover_chunk_masks
                     pos_emb = recover_pos_emb
                     mask_pad = recover_mask_pad
+                    xs = xs.masked_fill(~mask_pad[:, 0, :].unsqueeze(-1), 0.0)
 
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
 
@@ -375,6 +377,8 @@ class SqueezeformerEncoder(nn.Module):
                     att_mask = recover_att_mask
                     pos_emb = recover_pos_emb
                     mask_pad = recover_mask_pad
+                    if att_mask.size(1) != 0:
+                        xs = xs.masked_fill(~att_mask[:, 0, :].unsqueeze(-1), 0.0)
 
             factor = self.calculate_downsampling_factor(i)
 
