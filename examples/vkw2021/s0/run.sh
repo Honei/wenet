@@ -4,16 +4,25 @@
 
 . ./path.sh || exit 1;
 
-# Use this to control how many gpu you use, It's 1-gpu training if you specify
-# just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+# Automatically detect number of gpus
+if command -v nvidia-smi &> /dev/null; then
+  num_gpus=$(nvidia-smi -L | wc -l)
+  gpu_list=$(seq -s, 0 $((num_gpus-1)))
+else
+  num_gpus=-1
+  gpu_list="-1"
+fi
+# You can also manually specify CUDA_VISIBLE_DEVICES
+# if you don't want to utilize all available GPU resources.
+export CUDA_VISIBLE_DEVICES="${gpu_list}"
+echo "CUDA_VISIBLE_DEVICES is ${CUDA_VISIBLE_DEVICES}"
 stage=-1
 stop_stage=0
 
-# The num of nodes
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
-# The rank of current node
-node_rank=0
 
 # data
 data=data
@@ -33,6 +42,11 @@ checkpoint= #$dir/0.pt
 average_checkpoint=true
 decode_checkpoint=$dir/final.pt
 average_num=10
+
+train_engine=torch_ddp
+
+deepspeed_config=../../aishell/s0/conf/ds_stage2.json
+deepspeed_save_states="model_only"
 
 . tools/parse_options.sh || exit 1;
 
@@ -109,35 +123,27 @@ fi
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # Training
   mkdir -p $dir
-  INIT_FILE=$dir/ddp_init
-  # You had better rm it manually before you start run.sh on first node.
-  # rm -f $INIT_FILE # delete old one before starting
-  init_method=file://$(readlink -f $INIT_FILE)
-  echo "$0: init method is $init_method"
   # The number of gpus runing on each node/machine
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
-  dist_backend="gloo"
-  # The total number of processes/gpus, so that the master knows
-  # how many workers to wait for.
-  # More details about ddp can be found in
-  # https://pytorch.org/tutorials/intermediate/dist_tuto.html
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
+  dist_backend="nccl"
   cmvn_opts=
   $cmvn && cp ${data}/${train_set}/global_cmvn $dir
   $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
   # train.py will write $train_config to $dir/train.yaml with model input
   # and output dimension, train.yaml will be used for inference or model
   # export later
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=$i ###`expr $node_rank \* $num_gpus + $i`
-    echo "start training"
-    python wenet/bin/train.py --gpu $gpu_id \
+  if [ ${train_engine} == "deepspeed" ]; then
+    echo "$0: using deepspeed"
+  else
+    echo "$0: using torch ddp"
+  fi
+  echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
+  echo "start training"
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+           --rdzv_id=2023 --rdzv_backend="c10d" \
+    wenet/bin/train.py \
+      --train_engine ${train_engine} \
       --config $train_config \
       --data_type $data_type \
       --symbol_table $dict \
@@ -145,16 +151,12 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       --cv_data $data/${dev_set}/data.list \
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
       --ddp.dist_backend $dist_backend \
       --num_workers 4 \
       $cmvn_opts \
-      --pin_memory
-  } &
-  done
-  wait
+      --pin_memory \
+      --deepspeed_config ${deepspeed_config} \
+      --deepspeed.save_states ${deepspeed_save_states}
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then

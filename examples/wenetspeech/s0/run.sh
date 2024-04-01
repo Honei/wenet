@@ -5,16 +5,36 @@
 
 . ./path.sh || exit 1;
 
-# Use this to control how many gpu you use, It's 1-gpu training if you specify
-# just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-stage=0
+# Automatically detect number of gpus
+if command -v nvidia-smi &> /dev/null; then
+  num_gpus=$(nvidia-smi -L | wc -l)
+  gpu_list=$(seq -s, 0 $((num_gpus-1)))
+else
+  num_gpus=-1
+  gpu_list="-1"
+fi
+# You can also manually specify CUDA_VISIBLE_DEVICES
+# if you don't want to utilize all available GPU resources.
+export CUDA_VISIBLE_DEVICES="${gpu_list}"
+echo "CUDA_VISIBLE_DEVICES is ${CUDA_VISIBLE_DEVICES}"
+
+cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-""}
+if [ -z "$cuda_visible_devices" ]; then
+  echo "CUDA_VISIBLE_DEVICES is not set. Using default device_ids."
+  device_ids=(0 1 2 3 4 5 6 7)
+else
+  IFS=',' read -r -a device_ids <<< "$cuda_visible_devices"
+  echo "Using CUDA_VISIBLE_DEVICES: $cuda_visible_devices"
+fi
+echo "Parsed device_ids: ${device_ids[@]}"
+
+stage=4
 stop_stage=5
 
-# The num of nodes
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
-# The rank of current node
-node_rank=0
 
 # Use your own data path. You need to download the WenetSpeech dataset by yourself.
 wenetspeech_data_dir=/ssd/nfs07/binbinzhang/wenetspeech
@@ -27,16 +47,34 @@ train_set=train_`echo $set | tr 'A-Z' 'a-z'`
 dev_set=dev
 test_sets="test_net test_meeting"
 
-train_config=conf/train_conformer.yaml
+# NOTE(xcsong): we use step_save instead of epoch_save for large datasets
+epoch=100
+
+train_config=conf/train_u2++_conformer.yaml
 checkpoint=
-cmvn=true
+dir=exp/u2pp_conformer
+
 cmvn_sampling_divisor=20 # 20 means 5% of the training data to estimate cmvn
-dir=exp/conformer
 
 decode_checkpoint=
 average_checkpoint=true
-average_num=10
-decode_modes="attention_rescoring ctc_greedy_search"
+average_num=5
+average_mode=step
+max_step=88888888
+decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
+
+train_engine=torch_ddp
+
+deepspeed_config=../whisper/conf/ds_stage1.json
+deepspeed_save_states="model+optimizer"
+
+dict=data/dict/lang_char.txt
+decoding_chunk_size=
+ctc_weight=0.5
+reverse_weight=0.0
+blank_penalty=0.0
+length_penalty=0.0
+decode_batch=16
 
 . tools/parse_options.sh || exit 1;
 
@@ -57,40 +95,35 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     data || exit 1;
 fi
 
-dict=data/dict/lang_char.txt
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     echo "Make a dictionary"
     echo "dictionary: ${dict}"
     mkdir -p $(dirname $dict)
     echo "<blank> 0" > ${dict} # 0 will be used for "blank" in CTC
     echo "<unk> 1" >> ${dict} # <unk> must be 1
-    echo "▁ 2" >> ${dict} # ▁ is for space
+    echo "<sos/eos> 2" >> $dict
+    echo "▁ 3" >> ${dict} # ▁ is for space
     tools/text2token.py -s 1 -n 1 --space "▁" data/${train_set}/text \
         | cut -f 2- -d" " | tr " " "\n" \
         | sort | uniq | grep -a -v -e '^\s*$' \
         | grep -v "▁" \
-        | awk '{print $0 " " NR+2}' >> ${dict} \
+        | awk '{print $0 " " NR+3}' >> ${dict} \
         || exit 1;
-    num_token=$(cat $dict | wc -l)
-    echo "<sos/eos> $num_token" >> $dict
 fi
 
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
   echo "Compute cmvn"
   # Here we use all the training data, you can sample some some data to save time
   # BUG!!! We should use the segmented data for CMVN
-  if $cmvn; then
-    full_size=`cat data/${train_set}/wav.scp | wc -l`
-    sampling_size=$((full_size / cmvn_sampling_divisor))
-    shuf -n $sampling_size data/$train_set/wav.scp \
-      > data/$train_set/wav.scp.sampled
-    python3 tools/compute_cmvn_stats.py \
-    --num_workers 16 \
-    --train_config $train_config \
-    --in_scp data/$train_set/wav.scp.sampled \
-    --out_cmvn data/$train_set/global_cmvn \
-    || exit 1;
-  fi
+  full_size=`cat data/${train_set}/wav.scp | wc -l`
+  sampling_size=$((full_size / cmvn_sampling_divisor))
+  shuf -n $sampling_size data/$train_set/wav.scp \
+    > data/$train_set/wav.scp.sampled
+  python3 tools/compute_cmvn_stats.py \
+  --num_workers 16 \
+  --train_config $train_config \
+  --in_scp data/$train_set/wav.scp.sampled \
+  --out_cmvn data/$train_set/global_cmvn
 fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
@@ -112,89 +145,102 @@ fi
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   echo "Start training"
   mkdir -p $dir
-  # INIT_FILE is for DDP synchronization
-  INIT_FILE=$dir/ddp_init
-  init_method=file://$(readlink -f $INIT_FILE)
-  echo "$0: init method is $init_method"
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
   dist_backend="nccl"
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
-  cmvn_opts=
-  $cmvn && cp data/${train_set}/global_cmvn $dir
-  $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
   # train.py will write $train_config to $dir/train.yaml with model input
   # and output dimension, train.yaml will be used for inference or model
   # export later
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
+  if [ ${train_engine} == "deepspeed" ]; then
+    echo "$0: using deepspeed"
+  else
+    echo "$0: using torch ddp"
+  fi
+
+  # repeat data.list, we use step_save instead of epoch_save for large datasets
+  train_data=data/$train_set/data.list.repeat${epoch}
+  if [ ! -f "${train_data}" ]; then
+    echo "repeat data/$train_set/data.list ${epoch} times"
+    for (( i=1; i<=$epoch; i++ ))
+    do
+        cat "data/$train_set/data.list" >> "${train_data}"
+    done
+    echo "save new data.list in ${train_data}, it will be used for training"
+  else
+    echo "${train_data} already exists."
+  fi
+
+  echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+           --rdzv_id=2023 --rdzv_backend="c10d" \
+    wenet/bin/train.py \
+      --train_engine ${train_engine} \
       --config $train_config \
       --data_type "shard" \
-      --symbol_table $dict \
-      --train_data data/$train_set/data.list \
+      --train_data ${train_data} \
       --cv_data data/$dev_set/data.list \
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
       --ddp.dist_backend $dist_backend \
-      $cmvn_opts \
-      --num_workers 8 \
-      --pin_memory
-  } &
-  done
-  wait
+      --num_workers 2 \
+      --pin_memory \
+      --deepspeed_config ${deepspeed_config} \
+      --deepspeed.save_states ${deepspeed_save_states}
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   echo "Test model"
   if [ ${average_checkpoint} == true ]; then
-    decode_checkpoint=$dir/avg${average_num}.pt
+    decode_checkpoint=$dir/avg${average_num}_mode${average_mode}_max${max_step}.pt
     echo "do model average and final checkpoint is $decode_checkpoint"
     python wenet/bin/average_model.py \
         --dst_model $decode_checkpoint \
         --src_path $dir  \
         --num ${average_num} \
+        --mode ${average_mode} \
+        --max_step ${max_step} \
         --val_best
   fi
   # Specify decoding_chunk_size if it's a unified dynamic chunk trained model
   # -1 for full chunk
-  decoding_chunk_size=
-  ctc_weight=0.5
-  reverse_weight=0.0
+  i=0
   for testset in ${test_sets} ${dev_set}; do
   {
+    base=$(basename $decode_checkpoint)
+    result_dir=$dir/${testset}_${base}_chunk${decoding_chunk_size}_ctc${ctc_weight}_reverse${reverse_weight}_blankpenalty${blank_penalty}_lengthpenalty${length_penalty}
+    mkdir -p ${result_dir}
+    device_id=${device_ids[i % ${#device_ids[@]}]}
+    echo "Testing ${testset} on GPU ${device_id}"
+    python wenet/bin/recognize.py --gpu ${device_id} \
+      --modes $decode_modes \
+      --config $dir/train.yaml \
+      --data_type "shard" \
+      --test_data data/$testset/data.list \
+      --checkpoint $decode_checkpoint \
+      --beam_size 10 \
+      --batch_size ${decode_batch} \
+      --blank_penalty ${blank_penalty} \
+      --length_penalty ${length_penalty} \
+      --ctc_weight $ctc_weight \
+      --reverse_weight $reverse_weight \
+      --result_dir $result_dir \
+      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} &
+    ((i++))
+    if [[ $device_id -eq $((num_gpus - 1)) ]]; then
+      wait
+    fi
+  }
+  done
+  wait
+  for testset in ${test_sets} ${dev_set}; do
+  {
+    base=$(basename $decode_checkpoint)
+    result_dir=$dir/${testset}_${base}_chunk${decoding_chunk_size}_ctc${ctc_weight}_reverse${reverse_weight}_blankpenalty${blank_penalty}_lengthpenalty${length_penalty}
+    mkdir -p ${result_dir}
     for mode in ${decode_modes}; do
-    {
-      base=$(basename $decode_checkpoint)
-      result_dir=$dir/${testset}_${mode}_${base}
-      mkdir -p $result_dir
-      python wenet/bin/recognize.py --gpu 0 \
-        --mode $mode \
-        --config $dir/train.yaml \
-        --data_type "shard" \
-        --test_data data/$testset/data.list \
-        --checkpoint $decode_checkpoint \
-        --beam_size 10 \
-        --batch_size 1 \
-        --penalty 0.0 \
-        --dict $dict \
-        --ctc_weight $ctc_weight \
-        --reverse_weight $reverse_weight \
-        --result_file $result_dir/text \
-        ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
       python tools/compute-wer.py --char=1 --v=1 \
-        data/$testset/text $result_dir/text > $result_dir/wer
-    }
+        data/$testset/text $result_dir/$mode/text > $result_dir/$mode/wer
     done
-    wait
   }
   done
 fi

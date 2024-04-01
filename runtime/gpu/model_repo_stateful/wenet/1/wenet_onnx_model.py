@@ -1,4 +1,5 @@
-# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2021 NVIDIA CORPORATION
+#               2023 58.com(Wuba) Inc AI Lab.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,16 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import multiprocessing
 import numpy as np
 import os
 import torch
 import triton_python_backend_utils as pb_utils
 from torch.utils.dlpack import to_dlpack, from_dlpack
-from swig_decoders import ctc_beam_search_decoder_batch, Scorer, map_batch
+from swig_decoders import ctc_beam_search_decoder_batch, \
+    Scorer, HotWordsScorer, map_batch
+import yaml
+
 
 class WenetModel(object):
+
     def __init__(self, model_config, device):
         params = self.parse_model_parameters(model_config['parameters'])
 
@@ -48,6 +52,24 @@ class WenetModel(object):
         self.scorer = None
         if os.path.exists(lm_path):
             self.scorer = Scorer(alpha, beta, lm_path, self.vocab)
+
+        # load hotwords
+        self.hotwords_scorer = None
+        hotwords_path = params.get("hotwords_path", None)
+        if os.path.exists(hotwords_path):
+            self.hotwords = self.load_hotwords(hotwords_path)
+            max_order = 4
+            if self.hotwords is not None:
+                for w in self.hotwords:
+                    max_order = max(max_order, len(w))
+                self.hotwords_scorer = HotWordsScorer(self.hotwords,
+                                                      self.vocab,
+                                                      window_length=max_order,
+                                                      SPACE_ID=-2,
+                                                      is_character_based=True)
+                print(
+                    f"Successfully load hotwords! Hotwords orders = {max_order}"
+                )
 
         self.bidecoder = params.get('bidecoder')
         # rescore setting
@@ -92,15 +114,26 @@ class WenetModel(object):
             vocab[id] = char
         return (id2vocab, vocab, space_id, blank_id, sos_eos)
 
+    def load_hotwords(self, hotwords_file):
+        """
+        load hotwords.yaml
+        """
+        with open(hotwords_file, 'r', encoding="utf-8") as fin:
+            configs = yaml.load(fin, Loader=yaml.FullLoader)
+        return configs
+
     def parse_model_parameters(self, model_parameters):
-        model_p = {"beam_size": 10,
-                   "cutoff_prob": 0.999,
-                   "vocab_path": None,
-                   "lm_path": None,
-                   "alpha": 2.0,
-                   "beta": 1.0,
-                   "rescoring": 0,
-                   "bidecoder": 1}
+        model_p = {
+            "beam_size": 10,
+            "cutoff_prob": 0.999,
+            "vocab_path": None,
+            "lm_path": None,
+            "hotwords_path": None,
+            "alpha": 2.0,
+            "beta": 1.0,
+            "rescoring": 0,
+            "bidecoder": 1
+        }
         # get parameter configurations
         for li in model_parameters.items():
             key, value = li
@@ -115,8 +148,8 @@ class WenetModel(object):
         assert model_p["vocab_path"] is not None
         return model_p
 
-    def infer(self, batch_log_probs, batch_log_probs_idx,
-              seq_lens, rescore_index, batch_states):
+    def infer(self, batch_log_probs, batch_log_probs_idx, seq_lens,
+              rescore_index, batch_states):
         """
         batch_states = [trieVector, batch_start,
                        batch_encoder_hist, cur_encoder_out]
@@ -124,17 +157,20 @@ class WenetModel(object):
         trie_vector, batch_start, batch_encoder_hist, cur_encoder_out = batch_states
         num_processes = min(multiprocessing.cpu_count(), len(batch_log_probs))
 
-        score_hyps = self.batch_ctc_prefix_beam_search_cpu(batch_log_probs,
-                                                           batch_log_probs_idx,
-                                                           seq_lens,
-                                                           trie_vector,
-                                                           batch_start,
-                                                           self.beam_size,
-                                                           self.blank_id,
-                                                           self.space_id,
-                                                           self.cutoff_prob,
-                                                           num_processes,
-                                                           self.scorer)
+        score_hyps = self.batch_ctc_prefix_beam_search_cpu(
+            batch_log_probs,
+            batch_log_probs_idx,
+            seq_lens,
+            trie_vector,
+            batch_start,
+            self.beam_size,
+            self.blank_id,
+            self.space_id,
+            self.cutoff_prob,
+            num_processes,
+            self.scorer,
+            self.hotwords_scorer,
+        )
 
         if self.rescoring and len(rescore_index) != 0:
             # find the end of sequence
@@ -148,14 +184,16 @@ class WenetModel(object):
                 if hist_enc is None:
                     cur_enc = cur_encoder_out[idx]
                 else:
-                    cur_enc = torch.cat([hist_enc, cur_encoder_out[idx]], axis=0)
+                    cur_enc = torch.cat([hist_enc, cur_encoder_out[idx]],
+                                        axis=0)
                 rescore_encoder_hist.append(cur_enc)
                 cur_mask_len = int(len(hist_enc) + seq_lens[idx])
                 rescore_encoder_lens.append(cur_mask_len)
                 rescore_hyps.append(score_hyps[idx])
                 if cur_enc.shape[0] > max_length:
                     max_length = cur_enc.shape[0]
-            best_index = self.batch_rescoring(rescore_hyps, rescore_encoder_hist,
+            best_index = self.batch_rescoring(rescore_hyps,
+                                              rescore_encoder_hist,
                                               rescore_encoder_lens, max_length)
 
         best_sent = []
@@ -172,12 +210,11 @@ class WenetModel(object):
         return final_result, cur_encoder_out
 
     def batch_ctc_prefix_beam_search_cpu(self, batch_log_probs_seq,
-                                         batch_log_probs_idx,
-                                         batch_len, batch_root,
-                                         batch_start, beam_size,
-                                         blank_id, space_id,
-                                         cutoff_prob, num_processes,
-                                         scorer):
+                                         batch_log_probs_idx, batch_len,
+                                         batch_root, batch_start, beam_size,
+                                         blank_id, space_id, cutoff_prob,
+                                         num_processes, scorer,
+                                         hotwords_scorer):
         """
         Return: Batch x Beam_size elements, each element is a tuple
                 (score, list of ids),
@@ -188,18 +225,14 @@ class WenetModel(object):
         batch_log_probs_idx_list = []
         for i in range(len(batch_len_list)):
             cur_len = int(batch_len_list[i])
-            batch_log_probs_seq_list.append(batch_log_probs_seq[i][0:cur_len].tolist())
-            batch_log_probs_idx_list.append(batch_log_probs_idx[i][0:cur_len].tolist())
-        score_hyps = ctc_beam_search_decoder_batch(batch_log_probs_seq_list,
-                                                   batch_log_probs_idx_list,
-                                                   batch_root,
-                                                   batch_start,
-                                                   beam_size,
-                                                   num_processes,
-                                                   blank_id,
-                                                   space_id,
-                                                   cutoff_prob,
-                                                   scorer)
+            batch_log_probs_seq_list.append(
+                batch_log_probs_seq[i][0:cur_len].tolist())
+            batch_log_probs_idx_list.append(
+                batch_log_probs_idx[i][0:cur_len].tolist())
+        score_hyps = ctc_beam_search_decoder_batch(
+            batch_log_probs_seq_list, batch_log_probs_idx_list, batch_root,
+            batch_start, beam_size, num_processes, blank_id, space_id,
+            cutoff_prob, scorer, hotwords_scorer)
         return score_hyps
 
     def batch_rescoring(self, score_hyps, hist_enc, hist_mask_len, max_len):
@@ -236,10 +269,12 @@ class WenetModel(object):
                     max_seq_len = len(hyps[-1])
 
         max_seq_len += 2
-        hyps_pad_sos_eos = np.ones((bz, beam_size, max_seq_len), dtype=np.int64)
+        hyps_pad_sos_eos = np.ones((bz, beam_size, max_seq_len),
+                                   dtype=np.int64)
         hyps_pad_sos_eos = hyps_pad_sos_eos * self.eos  # fill eos
         if self.bidecoder:
-            r_hyps_pad_sos_eos = np.ones((bz, beam_size, max_seq_len), dtype=np.int64)
+            r_hyps_pad_sos_eos = np.ones((bz, beam_size, max_seq_len),
+                                         dtype=np.int64)
             r_hyps_pad_sos_eos = r_hyps_pad_sos_eos * self.eos
 
         hyps_lens_sos = np.ones((bz, beam_size), dtype=np.int32)
@@ -249,12 +284,13 @@ class WenetModel(object):
             length = len(cand) + 2
             bz_offset = idx % beam_size
             pad_cand = [self.sos] + cand + [self.eos]
-            hyps_pad_sos_eos[bz_id][bz_offset][0 : length] = pad_cand
+            hyps_pad_sos_eos[bz_id][bz_offset][0:length] = pad_cand
             if self.bidecoder:
                 r_pad_cand = [self.sos] + cand[::-1] + [self.eos]
                 r_hyps_pad_sos_eos[bz_id][bz_offset][0:length] = r_pad_cand
             hyps_lens_sos[bz_id][idx % beam_size] = len(cand) + 1
-        in0 = pb_utils.Tensor.from_dlpack("encoder_out", to_dlpack(encoder_out))
+        in0 = pb_utils.Tensor.from_dlpack("encoder_out",
+                                          to_dlpack(encoder_out))
         in1 = pb_utils.Tensor("encoder_out_lens", encoder_lens)
         in2 = pb_utils.Tensor("hyps_pad_sos_eos", hyps_pad_sos_eos)
         in3 = pb_utils.Tensor("hyps_lens_sos", hyps_lens_sos)
@@ -264,13 +300,14 @@ class WenetModel(object):
             input_tensors.append(in4)
         in5 = pb_utils.Tensor.from_dlpack("ctc_score", to_dlpack(ctc_score))
         input_tensors.append(in5)
-        request = pb_utils.InferenceRequest(model_name='decoder',
-                                            requested_output_names=['best_index'],
-                                            inputs=input_tensors)
+        request = pb_utils.InferenceRequest(
+            model_name='decoder',
+            requested_output_names=['best_index'],
+            inputs=input_tensors)
         response = request.exec()
         best_index = pb_utils.get_output_tensor_by_name(response, 'best_index')
         best_index = from_dlpack(best_index.to_dlpack()).clone()
-        best_index = best_index.numpy()[:, 0]
+        best_index = best_index.cpu().numpy()[:, 0]
         return best_index
 
     def __del__(self):

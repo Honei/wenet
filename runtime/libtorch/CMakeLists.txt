@@ -4,16 +4,18 @@ project(wenet VERSION 0.1)
 
 option(CXX11_ABI "whether to use CXX11_ABI libtorch" OFF)
 option(GRAPH_TOOLS "whether to build TLG graph tools" OFF)
-option(BUILD_TESTING "whether to build unit test" ON)
+option(BUILD_TESTING "whether to build unit test" OFF)
 
 option(GRPC "whether to build with gRPC" OFF)
 # TODO(Binbin Zhang): Change websocket to OFF since it depends on boost
 #                     which is a very big library
 option(WEBSOCKET "whether to build with websocket" ON)
+option(HTTP "whether to build with http" OFF)
 option(TORCH "whether to build with Torch" ON)
 option(ONNX "whether to build with ONNX" OFF)
 option(GPU "whether to build with GPU" OFF)
 
+set(CMAKE_CXX_FLAGS_DEBUG "$ENV{CXXFLAGS} -g")
 set(CMAKE_VERBOSE_MAKEFILE OFF)
 
 include(FetchContent)
@@ -25,7 +27,7 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 if(NOT MSVC)
   # Keep the same with openfst, -fPIC or -fpic
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -pthread -fPIC")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -pthread -fPIC")
 else()
   set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
   add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
@@ -38,11 +40,14 @@ endif()
 if(ONNX)
   include(onnx)
 endif()
+
 include(openfst)
 include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/kaldi
 )
+
+include(wetextprocessing)
 
 # Build all libraries
 add_subdirectory(utils)
@@ -62,6 +67,12 @@ endif()
 if(GRPC)
   include(grpc)
   add_subdirectory(grpc)
+endif()
+
+# Optionally, you can build with http
+if(HTTP)
+  include(boost)
+  add_subdirectory(http)
 endif()
 
 # Build all bins

@@ -23,13 +23,15 @@
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-# The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
-# communication. More details can be found in
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
-# export NCCL_SOCKET_IFNAME=ens4f1
-export NCCL_DEBUG=INFO
+
 stage=1 # start from 0 if you need to start from data preparation
 stop_stage=8
+
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
+num_nodes=1
+
 
 # here are extra parameters used in NST
 cer_out_dir=""
@@ -61,15 +63,6 @@ cer_hypo_dir="wenet_cer_hypo"
 cer_label_dir="wenet_cer_label"
 pseudo_data_ratio=0.75
 
-# The num of machines(nodes) for multi-machine training, 1 is for one machine.
-# NFS is required if num_nodes > 1.
-
-num_nodes=1
-
-# The rank of each node or machine, which ranges from 0 to `num_nodes - 1`.
-# You should set the node_ranHk=0 on the first machine, set the node_rank=1
-# on the second machine, and so on.
-node_rank=0
 dict=data/dict/lang_char.txt
 
 # data_type can be `raw` or `shard`. Typically, raw is used for small dataset,
@@ -79,13 +72,17 @@ data_type=shard
 num_utts_per_shard=1000
 train_set=train
 train_config=conf/train_conformer.yaml
-cmvn=true
 average_checkpoint=true
 target_pt=80
 decode_checkpoint=$dir/$target_pt.pt
 
 # here we only use attention_rescoring for NST
 decode_modes="attention_rescoring"
+
+train_engine=torch_ddp
+
+deepspeed_config=../../aishell/s0/conf/ds_stage2.json
+deepspeed_save_states="model_only"
 
 . tools/parse_options.sh || exit 1;
 
@@ -110,54 +107,37 @@ echo "enable_nst is ${enable_nst} "
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
   echo "********step 1 start time : $now ********"
   mkdir -p $dir
-  # You have to rm `INIT_FILE` manually when you resume or restart a
-  # multi-machine training.
-  rm $dir/ddp_init
-  INIT_FILE=$dir/ddp_init
-  init_method=file://$(readlink -f $INIT_FILE)
-  echo "$0: init method is $init_method"
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
-  dist_backend="gloo"
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
-
+  dist_backend="nccl"
   # the global_cmvn file need to be calculated by combining both supervised/unsupervised datasets,
   # and it should be positioned at data/${train_set}/global_cmvn .
-  cmvn_opts=
-  $cmvn && cp data/${train_set}/global_cmvn $dir/global_cmvn
-  $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
 
   # train.py rewrite $train_config to $dir/train.yaml with model input
   # and output dimension, and $dir/train.yaml will be used for inference
   # and export.
+  if [ ${train_engine} == "deepspeed" ]; then
+    echo "$0: using deepspeed"
+  else
+    echo "$0: using torch ddp"
+  fi
+  echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
   echo "checkpoint is "  ${checkpoint}
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    echo "gpu number  $i "
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+           --rdzv_id=2023 --rdzv_backend="c10d" \
+    wenet/bin/train.py \
+      --train_engine ${train_engine} \
       --config $train_config \
       --data_type $data_type \
-      --symbol_table $dict \
       --train_data data/$train_set/$data_list \
       --cv_data data/dev/data.list \
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
       --ddp.dist_backend $dist_backend \
       --num_workers 1 \
-      $cmvn_opts \
-      --pin_memory
-  } &
-  done
-  wait
+      --pin_memory \
+      --deepspeed_config ${deepspeed_config} \
+      --deepspeed.save_states ${deepspeed_save_states}
 fi
 
 # In stage 2, we get the averaged final checkpoint and calculate the test and dev accuracy
@@ -203,8 +183,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
       --checkpoint $decode_checkpoint \
       --beam_size 10 \
       --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
+      --blank_penalty 0.0 \
       --ctc_weight $ctc_weight \
       --reverse_weight $reverse_weight \
       --result_file $test_dir/text \
@@ -229,8 +208,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
       --checkpoint $decode_checkpoint \
       --beam_size 10 \
       --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
+      --blank_penalty 0.0 \
       --ctc_weight $ctc_weight \
       --reverse_weight $reverse_weight \
       --result_file $dev_dir/text \
@@ -288,8 +266,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     --checkpoint $decode_checkpoint \
     --beam_size 10 \
     --batch_size 1 \
-    --penalty 0.0 \
-    --dict $dict \
+    --blank_penalty 0.0 \
     --ctc_weight $ctc_weight \
     --reverse_weight $reverse_weight \
     --result_file data/train/${dir_split}data_sublist${job_num}/${hypo_name} \
@@ -345,9 +322,10 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
     --blank_skip_thresh 0.98 --ctc_weight 0.5 --rescoring_weight 1.0 \
     --chunk_size $chunk_size \
     --fst_path data/lang_test/TLG.fst \
+    --dict_path data/lang_test/words.txt \
     data/train/${dir_split}data_sublist${job_num}/wav.scp \
     data/train/${dir_split}data_sublist${job_num}/${hypo_name} $dir/final.zip \
-    data/lang_test/words.txt $dir/Hypo_LM_diff10/${cer_hypo_dir}_${job_num}
+    data/lang_test/units.txt $dir/Hypo_LM_diff10/${cer_hypo_dir}_${job_num}
   now=$(date +"%T")
   echo "end time : $now"
 fi
@@ -376,9 +354,10 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ] && [ ${label} -eq 1 ]; then
     --blank_skip_thresh 0.98 --ctc_weight 0.5 --rescoring_weight 1.0 \
     --chunk_size $chunk_size \
     --fst_path data/lang_test/TLG.fst \
+    --dict_path data/lang_test/words.txt \
     data/train/${dir_split}data_sublist${job_num}/wav.scp \
     data/train/${dir_split}data_sublist${job_num}/${label_file} $dir/final.zip \
-    data/lang_test/words.txt $dir/Hypo_LM_diff10/${cer_label_dir}_${job_num}
+    data/lang_test/units.txt $dir/Hypo_LM_diff10/${cer_label_dir}_${job_num}
   now=$(date +"%T")
   echo "end time : $now"
 fi

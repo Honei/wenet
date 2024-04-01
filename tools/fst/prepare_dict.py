@@ -41,23 +41,30 @@ with open(sys.argv[2], 'r', encoding='utf8') as fin, \
             if word in lexicon_table:
                 continue
             if bpemode:
-                pieces = sp.EncodeAsPieces(word)
+                # We assume that the lexicon does not contain code-switch,
+                # i.e. the word contains both English and Chinese.
+                # see PR https://github.com/wenet-e2e/wenet/pull/1693
+                # and Issue https://github.com/wenet-e2e/wenet/issues/1653
+                if word.replace('\'', '').encode("utf-8").isalpha():
+                    pieces = sp.EncodeAsPieces(word)
+                else:
+                    pieces = word
                 if contain_oov(pieces):
-                    print(
-                        'Ignoring words {}, which contains oov unit'.format(
-                            ''.join(word).strip('▁'))
-                    )
+                    print('Ignoring words {}, which contains oov unit'.format(
+                        ''.join(word).strip('▁')))
                     continue
                 chars = ' '.join(
                     [p if p in unit_table else '<unk>' for p in pieces])
             else:
                 # ignore words with OOV
                 if contain_oov(word):
-                    print('Ignoring words {}, which contains oov unit'.format(word))
+                    print('Ignoring words {}, which contains oov unit'.format(
+                        word))
                     continue
                 # Optional, append ▁ in front of english word
                 # we assume the model unit of our e2e system is char now.
-                if word.encode('utf8').isalpha() and '▁' in unit_table:
+                if word.replace('\'', '').encode("utf-8").isalpha() and \
+                        '▁' in unit_table:
                     word = '▁' + word
                 chars = ' '.join(word)  # word is a char list
             fout.write('{} {}\n'.format(word, chars))

@@ -13,32 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Modified from ESPnet(https://github.com/espnet/espnet)
-
 """Encoder definition."""
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
-from typeguard import check_argument_types
+import torch.utils.checkpoint as ckpt
 
-from wenet.transformer.attention import MultiHeadedAttention
-from wenet.transformer.attention import RelPositionMultiHeadedAttention
 from wenet.transformer.convolution import ConvolutionModule
-from wenet.transformer.embedding import PositionalEncoding
-from wenet.transformer.embedding import RelPositionalEncoding
-from wenet.transformer.embedding import NoPositionalEncoding
 from wenet.transformer.encoder_layer import TransformerEncoderLayer
 from wenet.transformer.encoder_layer import ConformerEncoderLayer
-from wenet.transformer.positionwise_feed_forward import PositionwiseFeedForward
-from wenet.transformer.subsampling import Conv2dSubsampling4
-from wenet.transformer.subsampling import Conv2dSubsampling6
-from wenet.transformer.subsampling import Conv2dSubsampling8
-from wenet.transformer.subsampling import LinearNoSubsampling
-from wenet.utils.common import get_activation
+from wenet.utils.class_utils import (
+    WENET_EMB_CLASSES,
+    WENET_MLP_CLASSES,
+    WENET_NORM_CLASSES,
+    WENET_SUBSAMPLE_CLASSES,
+    WENET_ATTENTION_CLASSES,
+    WENET_ACTIVATION_CLASSES,
+)
 from wenet.utils.mask import make_pad_mask
 from wenet.utils.mask import add_optional_chunk_mask
+from wenet.utils.common import mask_to_bias
 
 
 class BaseEncoder(torch.nn.Module):
+
     def __init__(
         self,
         input_size: int,
@@ -52,11 +50,14 @@ class BaseEncoder(torch.nn.Module):
         input_layer: str = "conv2d",
         pos_enc_layer_type: str = "abs_pos",
         normalize_before: bool = True,
-        concat_after: bool = False,
         static_chunk_size: int = 0,
         use_dynamic_chunk: bool = False,
         global_cmvn: torch.nn.Module = None,
         use_dynamic_left_chunk: bool = False,
+        gradient_checkpointing: bool = False,
+        use_sdpa: bool = False,
+        layer_norm_type: str = 'layer_norm',
+        norm_eps: float = 1e-5,
     ):
         """
         Args:
@@ -77,10 +78,6 @@ class BaseEncoder(torch.nn.Module):
             normalize_before (bool):
                 True: use layer_norm before each sub-block of a layer.
                 False: use layer_norm after each sub-block of a layer.
-            concat_after (bool): whether to concat attention layer's input
-                and output.
-                True: x -> x + linear(concat(x, att(x)))
-                False: x -> x + att(x)
             static_chunk_size (int): chunk size for static chunk training and
                 decoding
             use_dynamic_chunk (bool): whether use dynamic chunk size for
@@ -89,44 +86,34 @@ class BaseEncoder(torch.nn.Module):
             global_cmvn (Optional[torch.nn.Module]): Optional GlobalCMVN module
             use_dynamic_left_chunk (bool): whether use dynamic left chunk in
                 dynamic chunk training
+            query_bias: whether use bias in attention.linear_q
+            key_bias: whether use bias in attention.linear_k, False for whisper models.
+            value_bias: whether use bias in attention.linear_v
+            gradient_checkpointing: rerunning a forward-pass segment for each
+                checkpointed segment during backward.
+            use_sdpa: whether to use SDPA, currently only support transformer for now
         """
-        assert check_argument_types()
         super().__init__()
         self._output_size = output_size
 
-        if pos_enc_layer_type == "abs_pos":
-            pos_enc_class = PositionalEncoding
-        elif pos_enc_layer_type == "rel_pos":
-            pos_enc_class = RelPositionalEncoding
-        elif pos_enc_layer_type == "no_pos":
-            pos_enc_class = NoPositionalEncoding
-        else:
-            raise ValueError("unknown pos_enc_layer: " + pos_enc_layer_type)
-
-        if input_layer == "linear":
-            subsampling_class = LinearNoSubsampling
-        elif input_layer == "conv2d":
-            subsampling_class = Conv2dSubsampling4
-        elif input_layer == "conv2d6":
-            subsampling_class = Conv2dSubsampling6
-        elif input_layer == "conv2d8":
-            subsampling_class = Conv2dSubsampling8
-        else:
-            raise ValueError("unknown input_layer: " + input_layer)
-
         self.global_cmvn = global_cmvn
-        self.embed = subsampling_class(
+        self.embed = WENET_SUBSAMPLE_CLASSES[input_layer](
             input_size,
             output_size,
             dropout_rate,
-            pos_enc_class(output_size, positional_dropout_rate),
+            WENET_EMB_CLASSES[pos_enc_layer_type](output_size,
+                                                  positional_dropout_rate),
         )
 
+        assert layer_norm_type in ['layer_norm', 'rms_norm']
         self.normalize_before = normalize_before
-        self.after_norm = torch.nn.LayerNorm(output_size, eps=1e-5)
+        self.after_norm = WENET_NORM_CLASSES[layer_norm_type](output_size,
+                                                              eps=norm_eps)
         self.static_chunk_size = static_chunk_size
         self.use_dynamic_chunk = use_dynamic_chunk
         self.use_dynamic_left_chunk = use_dynamic_left_chunk
+        self.gradient_checkpointing = gradient_checkpointing
+        self.use_sdpa = use_sdpa
 
     def output_size(self) -> int:
         return self._output_size
@@ -156,6 +143,10 @@ class BaseEncoder(torch.nn.Module):
             xs: padded output tensor (B, T' ~= T/subsample_rate, D)
             masks: torch.Tensor batch padding mask after subsample
                 (B, 1, T' ~= T/subsample_rate)
+        NOTE(xcsong):
+            We pass the `__call__` method of the modules instead of `forward` to the
+            checkpointing API because `__call__` attaches all the hooks of the module.
+            https://discuss.pytorch.org/t/any-different-between-model-input-and-model-forward-input/3690/2
         """
         T = xs.size(1)
         masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
@@ -169,14 +160,37 @@ class BaseEncoder(torch.nn.Module):
                                               decoding_chunk_size,
                                               self.static_chunk_size,
                                               num_decoding_left_chunks)
-        for layer in self.encoders:
-            xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
+        if self.use_sdpa:
+            chunk_masks = mask_to_bias(chunk_masks, xs.dtype)
+        if self.gradient_checkpointing and self.training:
+            xs = self.forward_layers_checkpointed(xs, chunk_masks, pos_emb,
+                                                  mask_pad)
+        else:
+            xs = self.forward_layers(xs, chunk_masks, pos_emb, mask_pad)
         if self.normalize_before:
             xs = self.after_norm(xs)
         # Here we assume the mask is not changed in encoder layers, so just
         # return the masks before encoder layers, and the masks will be used
         # for cross attention with decoder later
         return xs, masks
+
+    def forward_layers(self, xs: torch.Tensor, chunk_masks: torch.Tensor,
+                       pos_emb: torch.Tensor,
+                       mask_pad: torch.Tensor) -> torch.Tensor:
+        for layer in self.encoders:
+            xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
+        return xs
+
+    @torch.jit.ignore(drop=True)
+    def forward_layers_checkpointed(self, xs: torch.Tensor,
+                                    chunk_masks: torch.Tensor,
+                                    pos_emb: torch.Tensor,
+                                    mask_pad: torch.Tensor) -> torch.Tensor:
+        for layer in self.encoders:
+            xs, chunk_masks, _, _ = ckpt.checkpoint(layer.__call__, xs,
+                                                    chunk_masks, pos_emb,
+                                                    mask_pad)
+        return xs
 
     def forward_chunk(
         self,
@@ -232,8 +246,8 @@ class BaseEncoder(torch.nn.Module):
         elayers, cache_t1 = att_cache.size(0), att_cache.size(2)
         chunk_size = xs.size(1)
         attention_key_size = cache_t1 + chunk_size
-        pos_emb = self.embed.position_encoding(
-            offset=offset - cache_t1, size=attention_key_size)
+        pos_emb = self.embed.position_encoding(offset=offset - cache_t1,
+                                               size=attention_key_size)
         if required_cache_size < 0:
             next_cache_start = 0
         elif required_cache_size == 0:
@@ -247,10 +261,11 @@ class BaseEncoder(torch.nn.Module):
             #   shape(att_cache[i:i + 1]) is (1, head, cache_t1, d_k * 2),
             #   shape(cnn_cache[i])       is (b=1, hidden-dim, cache_t2)
             xs, _, new_att_cache, new_cnn_cache = layer(
-                xs, att_mask, pos_emb,
+                xs,
+                att_mask,
+                pos_emb,
                 att_cache=att_cache[i:i + 1] if elayers > 0 else att_cache,
-                cnn_cache=cnn_cache[i] if cnn_cache.size(0) > 0 else cnn_cache
-            )
+                cnn_cache=cnn_cache[i] if cnn_cache.size(0) > 0 else cnn_cache)
             # NOTE(xcsong): After layer.forward
             #   shape(new_att_cache) is (1, head, attention_key_size, d_k * 2),
             #   shape(new_cnn_cache) is (b=1, hidden-dim, cache_t2)
@@ -317,17 +332,22 @@ class BaseEncoder(torch.nn.Module):
         for cur in range(0, num_frames - context + 1, stride):
             end = min(cur + decoding_window, num_frames)
             chunk_xs = xs[:, cur:end, :]
-            (y, att_cache, cnn_cache) = self.forward_chunk(
-                chunk_xs, offset, required_cache_size, att_cache, cnn_cache)
+            (y, att_cache,
+             cnn_cache) = self.forward_chunk(chunk_xs, offset,
+                                             required_cache_size, att_cache,
+                                             cnn_cache)
             outputs.append(y)
             offset += y.size(1)
         ys = torch.cat(outputs, 1)
-        masks = torch.ones((1, 1, ys.size(1)), device=ys.device, dtype=torch.bool)
+        masks = torch.ones((1, 1, ys.size(1)),
+                           device=ys.device,
+                           dtype=torch.bool)
         return ys, masks
 
 
 class TransformerEncoder(BaseEncoder):
     """Transformer encoder module."""
+
     def __init__(
         self,
         input_size: int,
@@ -341,36 +361,58 @@ class TransformerEncoder(BaseEncoder):
         input_layer: str = "conv2d",
         pos_enc_layer_type: str = "abs_pos",
         normalize_before: bool = True,
-        concat_after: bool = False,
         static_chunk_size: int = 0,
         use_dynamic_chunk: bool = False,
         global_cmvn: torch.nn.Module = None,
         use_dynamic_left_chunk: bool = False,
+        query_bias: bool = True,
+        key_bias: bool = True,
+        value_bias: bool = True,
+        mlp_bias: bool = True,
+        activation_type: str = "relu",
+        gradient_checkpointing: bool = False,
+        use_sdpa: bool = False,
+        mlp_type: str = 'position_wise_feed_forward',
+        layer_norm_type: str = 'layer_norm',
+        norm_eps: float = 1e-5,
+        n_kv_head: Optional[int] = None,
+        head_dim: Optional[int] = None,
     ):
         """ Construct TransformerEncoder
 
         See Encoder for the meaning of each parameter.
         """
-        assert check_argument_types()
         super().__init__(input_size, output_size, attention_heads,
                          linear_units, num_blocks, dropout_rate,
                          positional_dropout_rate, attention_dropout_rate,
                          input_layer, pos_enc_layer_type, normalize_before,
-                         concat_after, static_chunk_size, use_dynamic_chunk,
-                         global_cmvn, use_dynamic_left_chunk)
+                         static_chunk_size, use_dynamic_chunk, global_cmvn,
+                         use_dynamic_left_chunk, gradient_checkpointing,
+                         use_sdpa, layer_norm_type, norm_eps)
+        activation = WENET_ACTIVATION_CLASSES[activation_type]()
+        mlp_class = WENET_MLP_CLASSES[mlp_type]
         self.encoders = torch.nn.ModuleList([
             TransformerEncoderLayer(
                 output_size,
-                MultiHeadedAttention(attention_heads, output_size,
-                                     attention_dropout_rate),
-                PositionwiseFeedForward(output_size, linear_units,
-                                        dropout_rate), dropout_rate,
-                normalize_before, concat_after) for _ in range(num_blocks)
+                WENET_ATTENTION_CLASSES["selfattn"](attention_heads,
+                                                    output_size,
+                                                    attention_dropout_rate,
+                                                    query_bias, key_bias,
+                                                    value_bias, use_sdpa,
+                                                    n_kv_head, head_dim),
+                mlp_class(output_size, linear_units, dropout_rate, activation,
+                          mlp_bias),
+                dropout_rate,
+                normalize_before,
+                layer_norm_type=layer_norm_type,
+                norm_eps=norm_eps,
+            ) for _ in range(num_blocks)
         ])
 
 
 class ConformerEncoder(BaseEncoder):
     """Conformer encoder module."""
+
     def __init__(
         self,
         input_size: int,
@@ -384,7 +426,6 @@ class ConformerEncoder(BaseEncoder):
         input_layer: str = "conv2d",
         pos_enc_layer_type: str = "rel_pos",
         normalize_before: bool = True,
-        concat_after: bool = False,
         static_chunk_size: int = 0,
         use_dynamic_chunk: bool = False,
         global_cmvn: torch.nn.Module = None,
@@ -397,6 +438,18 @@ class ConformerEncoder(BaseEncoder):
         cnn_module_kernel: int = 15,
         causal: bool = False,
         cnn_module_norm: str = "batch_norm",
+        query_bias: bool = True,
+        key_bias: bool = True,
+        value_bias: bool = True,
+        mlp_bias: bool = True,
+        conv_bias: bool = True,
+        gradient_checkpointing: bool = False,
+        use_sdpa: bool = False,
+        mlp_type: str = 'position_wise_feed_forward',
+        layer_norm_type: str = 'layer_norm',
+        norm_eps: float = 1e-5,
+        n_kv_head: Optional[int] = None,
+        head_dim: Optional[int] = None,
     ):
         """Construct ConformerEncoder
 
@@ -413,50 +466,54 @@ class ConformerEncoder(BaseEncoder):
             use_cnn_module (bool): Whether to use convolution module.
             cnn_module_kernel (int): Kernel size of convolution module.
             causal (bool): whether to use causal convolution or not.
+            key_bias: whether use bias in attention.linear_k, False for whisper models.
         """
-        assert check_argument_types()
         super().__init__(input_size, output_size, attention_heads,
                          linear_units, num_blocks, dropout_rate,
                          positional_dropout_rate, attention_dropout_rate,
                          input_layer, pos_enc_layer_type, normalize_before,
-                         concat_after, static_chunk_size, use_dynamic_chunk,
-                         global_cmvn, use_dynamic_left_chunk)
-        activation = get_activation(activation_type)
+                         static_chunk_size, use_dynamic_chunk, global_cmvn,
+                         use_dynamic_left_chunk, gradient_checkpointing,
+                         use_sdpa, layer_norm_type, norm_eps)
+        activation = WENET_ACTIVATION_CLASSES[activation_type]()
 
         # self-attention module definition
-        if pos_enc_layer_type != "rel_pos":
-            encoder_selfattn_layer = MultiHeadedAttention
-        else:
-            encoder_selfattn_layer = RelPositionMultiHeadedAttention
         encoder_selfattn_layer_args = (
             attention_heads,
             output_size,
             attention_dropout_rate,
+            query_bias,
+            key_bias,
+            value_bias,
+            use_sdpa,
+            n_kv_head,
+            head_dim,
         )
         # feed-forward module definition
-        positionwise_layer = PositionwiseFeedForward
         positionwise_layer_args = (
             output_size,
             linear_units,
             dropout_rate,
             activation,
+            mlp_bias,
         )
         # convolution module definition
-        convolution_layer = ConvolutionModule
         convolution_layer_args = (output_size, cnn_module_kernel, activation,
-                                  cnn_module_norm, causal)
+                                  cnn_module_norm, causal, conv_bias)
 
+        mlp_class = WENET_MLP_CLASSES[mlp_type]
         self.encoders = torch.nn.ModuleList([
             ConformerEncoderLayer(
                 output_size,
-                encoder_selfattn_layer(*encoder_selfattn_layer_args),
-                positionwise_layer(*positionwise_layer_args),
-                positionwise_layer(
-                    *positionwise_layer_args) if macaron_style else None,
-                convolution_layer(
+                WENET_ATTENTION_CLASSES[selfattention_layer_type](
+                    *encoder_selfattn_layer_args),
+                mlp_class(*positionwise_layer_args),
+                mlp_class(*positionwise_layer_args) if macaron_style else None,
+                ConvolutionModule(
                     *convolution_layer_args) if use_cnn_module else None,
                 dropout_rate,
                 normalize_before,
-                concat_after,
+                layer_norm_type=layer_norm_type,
+                norm_eps=norm_eps,
             ) for _ in range(num_blocks)
         ])

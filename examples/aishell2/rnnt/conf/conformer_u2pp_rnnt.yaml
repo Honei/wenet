@@ -21,8 +21,10 @@ encoder_conf:
     cnn_module_norm: 'layer_norm' # using nn.LayerNorm makes model converge faster
     use_dynamic_left_chunk: false
 
-
+joint: transducer_joint
 joint_conf:
+    enc_output_size: 256
+    pred_output_size: 256
     join_dim: 512
     prejoin_linear: True
     postjoin_linear: false
@@ -51,7 +53,31 @@ decoder_conf:
   self_attention_dropout_rate: 0.1
   src_attention_dropout_rate: 0.1
 
+tokenizer: char
+tokenizer_conf:
+  symbol_table_path: 'data/dict/lang_char.txt'
+  split_with_space: false
+  bpe_path: null
+  non_lang_syms_path: null
+  is_multilingual: false
+  num_languages: 1
+  special_tokens:
+    <blank>: 0
+    <unk>: 1
+    <sos>: 2
+    <eos>: 2
+
+ctc: ctc
+ctc_conf:
+  ctc_blank_id: 0
+
+cmvn: global_cmvn
+cmvn_conf:
+  cmvn_file: 'data/train/global_cmvn'
+  is_json_cmvn: true
+
 # hybrid transducer+ctc+attention
+model: transducer
 model_conf:
     transducer_weight: 0.75
     ctc_weight: 0.1
@@ -60,6 +86,7 @@ model_conf:
     length_normalized_loss: false
     reverse_weight: 0.3
 
+dataset: asr
 dataset_conf:
     filter_conf:
         max_length: 40960

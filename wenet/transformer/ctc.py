@@ -13,19 +13,22 @@
 # limitations under the License.
 # Modified from ESPnet(https://github.com/espnet/espnet)
 
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
-from typeguard import check_argument_types
 
 
 class CTC(torch.nn.Module):
     """CTC module"""
+
     def __init__(
         self,
         odim: int,
         encoder_output_size: int,
         dropout_rate: float = 0.0,
         reduce: bool = True,
+        blank_id: int = 0,
     ):
         """ Construct CTC module
         Args:
@@ -33,18 +36,21 @@ class CTC(torch.nn.Module):
             encoder_output_size: number of encoder projection units
             dropout_rate: dropout rate (0.0 ~ 1.0)
             reduce: reduce the CTC loss into a scalar
+            blank_id: blank label.
         """
-        assert check_argument_types()
         super().__init__()
         eprojs = encoder_output_size
         self.dropout_rate = dropout_rate
         self.ctc_lo = torch.nn.Linear(eprojs, odim)
 
         reduction_type = "sum" if reduce else "none"
-        self.ctc_loss = torch.nn.CTCLoss(reduction=reduction_type)
+        self.ctc_loss = torch.nn.CTCLoss(blank=blank_id,
+                                         reduction=reduction_type,
+                                         zero_infinity=True)
 
     def forward(self, hs_pad: torch.Tensor, hlens: torch.Tensor,
-                ys_pad: torch.Tensor, ys_lens: torch.Tensor) -> torch.Tensor:
+                ys_pad: torch.Tensor,
+                ys_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculate CTC loss.
 
         Args:
@@ -61,7 +67,8 @@ class CTC(torch.nn.Module):
         loss = self.ctc_loss(ys_hat, ys_pad, hlens, ys_lens)
         # Batch-size average
         loss = loss / ys_hat.size(1)
-        return loss
+        ys_hat = ys_hat.transpose(0, 1)
+        return loss, ys_hat
 
     def log_softmax(self, hs_pad: torch.Tensor) -> torch.Tensor:
         """log_softmax of frame activations

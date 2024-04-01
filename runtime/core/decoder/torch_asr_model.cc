@@ -24,6 +24,7 @@
 #ifndef IOS
 #include "torch/torch.h"
 #endif
+#include <torch/csrc/jit/passes/tensorexpr_fuser.h>
 
 namespace wenet {
 
@@ -46,6 +47,9 @@ void TorchAsrModel::Read(const std::string& model_path) {
     device = at::kCUDA;
   }
 #endif
+#ifdef USE_IPEX
+  torch::jit::setTensorExprFuserEnabled(false);
+#endif
   torch::jit::script::Module model = torch::jit::load(model_path, device);
   model_ = std::make_shared<TorchModule>(std::move(model));
   torch::NoGradGuard no_grad;
@@ -65,6 +69,11 @@ void TorchAsrModel::Read(const std::string& model_path) {
   torch::jit::IValue o5 = model_->run_method("is_bidirectional_decoder");
   CHECK_EQ(o5.isBool(), true);
   is_bidirectional_decoder_ = o5.toBool();
+
+  torch::jit::setGraphExecutorOptimize(false);
+  torch::jit::FusionStrategy static0 = {
+      {torch::jit::FusionBehavior::STATIC, 0}};
+  torch::jit::setFusionStrategy(static0);
 
   VLOG(1) << "Torch Model Info:";
   VLOG(1) << "\tsubsampling_rate " << subsampling_rate_;

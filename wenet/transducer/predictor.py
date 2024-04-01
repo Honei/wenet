@@ -2,8 +2,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
-from typeguard import check_argument_types
-from wenet.utils.common import get_activation, get_rnn
+from wenet.utils.class_utils import WENET_ACTIVATION_CLASSES, WENET_RNN_CLASSES
 
 
 def ApplyPadding(input, padding, pad_value) -> torch.Tensor:
@@ -39,6 +38,9 @@ class PredictorBase(torch.nn.Module):
         _ = cache
         raise NotImplementedError("this is a base precictor")
 
+    def output_size(self):
+        raise NotImplementedError("this is a base precictor")
+
     def forward(
         self,
         input: torch.Tensor,
@@ -67,23 +69,26 @@ class RNNPredictor(PredictorBase):
                  bias: bool = True,
                  rnn_type: str = "lstm",
                  dropout: float = 0.1) -> None:
-        assert check_argument_types()
         super().__init__()
         self.n_layers = num_layers
         self.hidden_size = hidden_size
+        self._output_size = output_size
         # disable rnn base out projection
         self.embed = nn.Embedding(voca_size, embed_size)
         self.dropout = nn.Dropout(embed_dropout)
         # NOTE(Mddct): rnn base from torch not support layer norm
         # will add layer norm and prune value in cell and layer
         # ref: https://github.com/Mddct/neural-lm/blob/main/models/gru_cell.py
-        self.rnn = get_rnn(rnn_type=rnn_type)(input_size=embed_size,
-                                              hidden_size=hidden_size,
-                                              num_layers=num_layers,
-                                              bias=bias,
-                                              batch_first=True,
-                                              dropout=dropout)
+        self.rnn = WENET_RNN_CLASSES[rnn_type](input_size=embed_size,
+                                               hidden_size=hidden_size,
+                                               num_layers=num_layers,
+                                               bias=bias,
+                                               batch_first=True,
+                                               dropout=dropout)
         self.projection = nn.Linear(hidden_size, output_size)
+
+    def output_size(self):
+        return self._output_size
 
     def forward(
         self,
@@ -195,8 +200,9 @@ class RNNPredictor(PredictorBase):
         out, (m, c) = self.rnn(embed, (state_m, state_c))
 
         out = self.projection(out)
-        m = ApplyPadding(m, padding, state_m)
-        c = ApplyPadding(c, padding, state_c)
+        m = ApplyPadding(m, padding.unsqueeze(0), state_m)
+        c = ApplyPadding(c, padding.unsqueeze(0), state_c)
+
         return (out, [m, c])
 
 
@@ -212,6 +218,7 @@ class EmbeddingPredictor(PredictorBase):
     def __init__(self,
                  voca_size: int,
                  embed_size: int,
+                 output_size: int,
                  embed_dropout: float,
                  n_head: int,
                  history_size: int = 2,
@@ -219,8 +226,8 @@ class EmbeddingPredictor(PredictorBase):
                  bias: bool = False,
                  layer_norm_epsilon: float = 1e-5) -> None:
 
-        assert check_argument_types()
         super().__init__()
+        assert output_size == embed_size
         # multi head
         self.num_heads = n_head
         self.embed_size = embed_size
@@ -232,7 +239,10 @@ class EmbeddingPredictor(PredictorBase):
         self.embed_dropout = nn.Dropout(p=embed_dropout)
         self.ffn = nn.Linear(self.embed_size, self.embed_size)
         self.norm = nn.LayerNorm(self.embed_size, eps=layer_norm_epsilon)
-        self.activatoin = get_activation(activation)
+        self.activatoin = WENET_ACTIVATION_CLASSES[activation]()
+
+    def output_size(self):
+        return self.embed_size
 
     def init_state(self,
                    batch_size: int,
@@ -371,14 +381,15 @@ class ConvPredictor(PredictorBase):
     def __init__(self,
                  voca_size: int,
                  embed_size: int,
+                 output_size: int,
                  embed_dropout: float,
                  history_size: int = 2,
                  activation: str = "relu",
                  bias: bool = False,
                  layer_norm_epsilon: float = 1e-5) -> None:
-        assert check_argument_types()
         super().__init__()
 
+        assert embed_size == output_size
         assert history_size >= 0
         self.embed_size = embed_size
         self.context_size = history_size + 1
@@ -391,7 +402,10 @@ class ConvPredictor(PredictorBase):
                               groups=embed_size,
                               bias=bias)
         self.norm = nn.LayerNorm(embed_size, eps=layer_norm_epsilon)
-        self.activatoin = get_activation(activation)
+        self.activatoin = WENET_ACTIVATION_CLASSES[activation]()
+
+    def output_size(self):
+        return self.embed_size
 
     def init_state(self,
                    batch_size: int,

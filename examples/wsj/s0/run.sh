@@ -6,21 +6,14 @@
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
 export CUDA_VISIBLE_DEVICES="0"
-# The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
-# communication. More details can be found in
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
-# export NCCL_SOCKET_IFNAME=ens4f1
-export NCCL_DEBUG=INFO
 stage=0     # start from 0 if you need to start from data preparation
 stop_stage=4
-# The num of nodes or machines used for multi-machine training
-# Default 1 for single machine/node
-# NFS will be needed if you want run multi-machine training
+
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
-# The rank of each node or machine, range from 0 to num_nodes -1
-# The first node/machine sets node_rank 0, the second one sets node_rank 1
-# the third one set node_rank 2, and so on. Default 0
-node_rank=0
+
 # data
 WSJ0=/home/lsq/corpus/WSJ/wsj0
 WSJ1=/home/lsq/corpus/WSJ/wsj1
@@ -56,6 +49,11 @@ average_checkpoint=true
 decode_checkpoint=$dir/final.pt
 average_num=20
 decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
+
+train_engine=torch_ddp
+
+deepspeed_config=../../aishell/s0/conf/ds_stage2.json
+deepspeed_save_states="model_only"
 
 . tools/parse_options.sh || exit 1;
 
@@ -125,16 +123,9 @@ fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   mkdir -p $dir
-  # You have to rm `INIT_FILE` manually when you resume or restart a
-  # multi-machine training.
-  INIT_FILE=$dir/ddp_init
-  init_method=file://$(readlink -f $INIT_FILE)
-  echo "$0: init method is $init_method"
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
-  dist_backend="gloo"
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
+  dist_backend="nccl"
   cmvn_opts=
   $cmvn && cp data/${train_set}/global_cmvn $dir
   $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
@@ -142,13 +133,16 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # train.py rewrite $train_config to $dir/train.yaml with model input
   # and output dimension, and $dir/train.yaml will be used for inference
   # and export.
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
+  if [ ${train_engine} == "deepspeed" ]; then
+    echo "$0: using deepspeed"
+  else
+    echo "$0: using torch ddp"
+  fi
+  echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+           --rdzv_id=2023 --rdzv_backend="c10d" \
+    wenet/bin/train.py \
+      --train_engine ${train_engine} \
       --config $train_config \
       --data_type $data_type \
       --symbol_table $dict \
@@ -156,17 +150,13 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       --cv_data data/$valid_set/data.list \
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
       --ddp.dist_backend $dist_backend \
       --num_workers 1 \
       $cmvn_opts \
       --pin_memory \
-      --non_lang_syms ${nlsyms}
-  } &
-  done
-  wait
+      --non_lang_syms ${nlsyms} \
+      --deepspeed_config ${deepspeed_config} \
+      --deepspeed.save_states ${deepspeed_save_states}
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -199,7 +189,7 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
       --checkpoint $decode_checkpoint \
       --beam_size 10 \
       --batch_size 1 \
-      --penalty 0.0 \
+      --blank_penalty 0.0 \
       --dict $dict \
       --non_lang_syms $nlsyms \
       --ctc_weight $ctc_weight \

@@ -13,17 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Modified from ESPnet(https://github.com/espnet/espnet)
-
 """ConvolutionModule definition."""
 from typing import Tuple
 
 import torch
 from torch import nn
-from typeguard import check_argument_types
 
 
 class ConvolutionModule(nn.Module):
     """ConvolutionModule in Conformer model."""
+
     def __init__(self,
                  channels: int,
                  kernel_size: int = 15,
@@ -39,7 +38,6 @@ class ConvolutionModule(nn.Module):
             causal (int): Whether use causal convolution or not
             stride (int): Stride Convolution, for efficient Conformer
         """
-        assert check_argument_types()
         super().__init__()
 
         self.pointwise_conv1 = nn.Conv1d(

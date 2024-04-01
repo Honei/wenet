@@ -4,25 +4,43 @@
 
 . ./path.sh || exit 1;
 
-# Use this to control how many gpu you use, It's 1-gpu training if you specify
-# just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+# Automatically detect number of gpus
+if command -v nvidia-smi &> /dev/null; then
+  num_gpus=$(nvidia-smi -L | wc -l)
+  gpu_list=$(seq -s, 0 $((num_gpus-1)))
+else
+  num_gpus=-1
+  gpu_list="-1"
+fi
+# You can also manually specify CUDA_VISIBLE_DEVICES
+# if you don't want to utilize all available GPU resources.
+export CUDA_VISIBLE_DEVICES="${gpu_list}"
+echo "CUDA_VISIBLE_DEVICES is ${CUDA_VISIBLE_DEVICES}"
 stage=0 # start from 0 if you need to start from data preparation
 stop_stage=5
+
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
+num_nodes=1
+job_id=2023
+
 # data
 data_url=www.openslr.org/resources/12
 # use your own data path
 datadir=/export/data/en-asr-data/OpenSLR
 # wav data dir
 wave_data=data
+data_type=raw
 # Optional train_config
 # 1. conf/train_transformer_large.yaml: Standard transformer
 train_config=conf/train_conformer.yaml
 checkpoint=
-cmvn=true
+num_workers=1
 do_delta=false
 
 dir=exp/sp_spec_aug
+tensorboard_dir=tensorboard
 
 # use average_checkpoint will get better result
 average_checkpoint=true
@@ -30,8 +48,6 @@ decode_checkpoint=$dir/final.pt
 # maybe you can try to adjust it if you can not get close results as README.md
 average_num=10
 decode_modes="attention_rescoring ctc_greedy_search ctc_prefix_beam_search attention"
-
-. tools/parse_options.sh || exit 1;
 
 # bpemode (unigram or bpe)
 nbpe=5000
@@ -44,6 +60,13 @@ set -o pipefail
 train_set=train_960
 dev_set=dev
 recog_set="test_clean test_other dev_clean dev_other"
+
+train_engine=torch_ddp
+
+deepspeed_config=../../aishell/s0/conf/ds_stage2.json
+deepspeed_save_states="model_only"
+
+. tools/parse_options.sh || exit 1;
 
 if [ ${stage} -le -1 ] && [ ${stop_stage} -ge -1 ]; then
   echo "stage -1: Data Download"
@@ -98,14 +121,12 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
 
   echo "<blank> 0" > ${dict} # 0 will be used for "blank" in CTC
   echo "<unk> 1" >> ${dict} # <unk> must be 1
+  echo "<sos/eos> 2" >> $dict # <eos>
 
   # we borrowed these code and scripts which are related bpe from ESPnet.
   cut -f 2- -d" " $wave_data/${train_set}/text > $wave_data/lang_char/input.txt
   tools/spm_train --input=$wave_data/lang_char/input.txt --vocab_size=${nbpe} --model_type=${bpemode} --model_prefix=${bpemodel} --input_sentence_size=100000000
-  tools/spm_encode --model=${bpemodel}.model --output_format=piece < $wave_data/lang_char/input.txt | tr ' ' '\n' | sort | uniq | awk '{print $0 " " NR+1}' >> ${dict}
-  num_token=$(cat $dict | wc -l)
-  echo "<sos/eos> $num_token" >> $dict # <eos>
-  wc -l ${dict}
+  tools/spm_encode --model=${bpemodel}.model --output_format=piece < $wave_data/lang_char/input.txt | tr ' ' '\n' | sort | uniq | awk '{print $0 " " NR+2}' >> ${dict}
 fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
@@ -122,46 +143,38 @@ fi
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # Training
   mkdir -p $dir
-  INIT_FILE=$dir/ddp_init
-  rm -f $INIT_FILE # delete old one before starting
-  init_method=file://$(readlink -f $INIT_FILE)
-  echo "$0: init method is $init_method"
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
-  dist_backend="gloo"
-  cmvn_opts=
-  $cmvn && cmvn_opts="--cmvn $wave_data/${train_set}/global_cmvn"
+  dist_backend="nccl"
   # train.py will write $train_config to $dir/train.yaml with model input
   # and output dimension, train.yaml will be used for inference or model
   # export later
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    python wenet/bin/train.py --gpu $gpu_id \
+  if [ ${train_engine} == "deepspeed" ]; then
+    echo "$0: using deepspeed"
+  else
+    echo "$0: using torch ddp"
+  fi
+  echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+           --rdzv_id=$job_id --rdzv_backend="c10d" \
+    wenet/bin/train.py \
+      --train_engine ${train_engine} \
       --config $train_config \
-      --data_type raw \
-      --symbol_table $dict \
-      --bpe_model ${bpemodel}.model \
+      --data_type ${data_type} \
       --train_data $wave_data/$train_set/data.list \
       --cv_data $wave_data/$dev_set/data.list \
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $num_gpus \
-      --ddp.rank $i \
+      --tensorboard_dir ${tensorboard_dir} \
       --ddp.dist_backend $dist_backend \
-      --num_workers 1 \
-      $cmvn_opts \
-      --pin_memory
-  } &
-  done
-  wait
+      --num_workers ${num_workers} \
+      --pin_memory \
+      --deepspeed_config ${deepspeed_config} \
+      --deepspeed.save_states ${deepspeed_save_states}
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   # Test model, please specify the model you want to test by --checkpoint
-  cmvn_opts=
-  $cmvn && cmvn_opts="--cmvn data/${train_set}/global_cmvn"
   # TODO, Add model average here
   mkdir -p $dir/test
   if [ ${average_checkpoint} == true ]; then
@@ -177,50 +190,27 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   # -1 for full chunk
   decoding_chunk_size=
   ctc_weight=0.5
-  # Polling GPU id begin with index 0
-  num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
-  idx=0
   for test in $recog_set; do
-    for mode in ${decode_modes}; do
-    {
-      {
-        test_dir=$dir/${test}_${mode}
-        mkdir -p $test_dir
-        gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$idx+1])
-        python wenet/bin/recognize.py --gpu $gpu_id \
-          --mode $mode \
-          --config $dir/train.yaml \
-          --data_type raw \
-          --dict $dict \
-          --bpe_model ${bpemodel}.model \
-          --test_data $wave_data/$test/data.list \
-          --checkpoint $decode_checkpoint \
-          --beam_size 10 \
-          --batch_size 1 \
-          --penalty 0.0 \
-          --result_file $test_dir/text_bpe \
-          --ctc_weight $ctc_weight \
-          ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
+    result_dir=$dir/${test}
+    python wenet/bin/recognize.py --gpu 0 \
+      --modes $decode_modes \
+      --config $dir/train.yaml \
+      --data_type raw \
+      --test_data $wave_data/$test/data.list \
+      --checkpoint $decode_checkpoint \
+      --beam_size 10 \
+      --batch_size 16 \
+      --blank_penalty 0.0 \
+      --result_dir $result_dir \
+      --ctc_weight $ctc_weight \
+      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
 
-        cut -f2- -d " " $test_dir/text_bpe > $test_dir/text_bpe_value_tmp
-        cut -f1 -d " " $test_dir/text_bpe > $test_dir/text_bpe_key_tmp
-        tools/spm_decode --model=${bpemodel}.model --input_format=piece \
-          < $test_dir/text_bpe_value_tmp | sed -e "s/▁/ /g" > $test_dir/text_value_tmp
-        paste -d " " $test_dir/text_bpe_key_tmp $test_dir/text_value_tmp > $test_dir/text
-
-        python tools/compute-wer.py --char=1 --v=1 \
-          $wave_data/$test/text $test_dir/text > $test_dir/wer
-      } &
-
-      ((idx+=1))
-      if [ $idx -eq $num_gpus ]; then
-        idx=0
-      fi
-    }
+    for mode in $decode_modes; do
+      test_dir=$result_dir/$mode
+      python tools/compute-wer.py --char=1 --v=1 \
+        $wave_data/$test/text $test_dir/text > $test_dir/wer
     done
   done
-  wait
-
 fi
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then

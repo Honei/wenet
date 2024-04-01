@@ -3,24 +3,26 @@
 # Copyright 2019 Mobvoi Inc. All Rights Reserved.
 . ./path.sh || exit 1;
 
-# Use this to control how many gpu you use, It's 1-gpu training if you specify
-# just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-# The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
-# communication. More details can be found in
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
-# export NCCL_SOCKET_IFNAME=ens4f1
-export NCCL_DEBUG=INFO
+# Automatically detect number of gpus
+if command -v nvidia-smi &> /dev/null; then
+  num_gpus=$(nvidia-smi -L | wc -l)
+  gpu_list=$(seq -s, 0 $((num_gpus-1)))
+else
+  num_gpus=-1
+  gpu_list="-1"
+fi
+# You can also manually specify CUDA_VISIBLE_DEVICES
+# if you don't want to utilize all available GPU resources.
+export CUDA_VISIBLE_DEVICES="${gpu_list}"
+echo "CUDA_VISIBLE_DEVICES is ${CUDA_VISIBLE_DEVICES}"
 stage=0 # start from 0 if you need to start from data preparation
 stop_stage=6
-# The num of nodes or machines used for multi-machine training
-# Default 1 for single machine/node
-# NFS will be needed if you want run multi-machine training
+
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
-# The rank of each node or machine, range from 0 to num_nodes -1
-# The first node/machine sets node_rank 0, the second one sets node_rank 1
-# the third one set node_rank 2, and so on. Default 0
-node_rank=0
+job_id=2023
 
 # modify this to your AISHELL-2 data path
 # Note: the evaluation data (dev & test) is available at AISHELL.
@@ -39,7 +41,6 @@ train_set=train
 # 3. conf/train_unified_conformer.yaml: Unified dynamic chunk causal conformer
 # 4. conf/train_unified_transformer.yaml: Unified dynamic chunk transformer
 train_config=conf/train_unified_transformer.yaml
-cmvn=true
 dir=exp/transformer
 checkpoint=
 
@@ -48,6 +49,11 @@ average_checkpoint=true
 decode_checkpoint=$dir/final.pt
 average_num=30
 decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
+
+train_engine=torch_ddp
+
+deepspeed_config=../../aishell/s0/conf/ds_stage2.json
+deepspeed_save_states="model_only"
 
 . tools/parse_options.sh || exit 1;
 
@@ -80,10 +86,9 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
     mkdir -p $(dirname $dict)
     echo "<blank> 0" > ${dict} # 0 will be used for "blank" in CTC
     echo "<unk> 1" >> ${dict} # <unk> must be 1
+    echo "<sos/eos> 2" >> $dict # <eos>
     tools/text2token.py -s 1 -n 1 data/${train_set}/text | cut -f 2- -d" " | tr " " "\n" \
-        | sort | uniq | grep -a -v -e '^\s*$' | awk '{print $0 " " NR+1}' >> ${dict}
-    num_token=$(cat $dict | wc -l)
-    echo "<sos/eos> $num_token" >> $dict # <eos>
+        | sort | uniq | grep -a -v -e '^\s*$' | awk '{print $0 " " NR+2}' >> ${dict}
 fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
@@ -97,50 +102,34 @@ fi
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     # Training
     mkdir -p $dir
-    INIT_FILE=$dir/ddp_init
-    # You had better rm it manually before you start run.sh on first node.
-    # rm -f $INIT_FILE # delete old one before starting
-    init_method=file://$(readlink -f $INIT_FILE)
-    echo "$0: init method is $init_method"
     # The number of gpus runing on each node/machine
     num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
     # Use "nccl" if it works, otherwise use "gloo"
-    dist_backend="gloo"
-    # The total number of processes/gpus, so that the master knows
-    # how many workers to wait for.
-    # More details about ddp can be found in
-    # https://pytorch.org/tutorials/intermediate/dist_tuto.html
-    world_size=`expr $num_gpus \* $num_nodes`
-    echo "total gpus is: $world_size"
-    cmvn_opts=
-    $cmvn && cp data/${train_set}/global_cmvn $dir
-    $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
+    dist_backend="nccl"
     # train.py will write $train_config to $dir/train.yaml with model input
     # and output dimension, train.yaml will be used for inference or model
     # export later
-    for ((i = 0; i < $num_gpus; ++i)); do
-    {
-        gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
-            --config $train_config \
-            --data_type raw \
-            --symbol_table $dict \
-            --train_data data/$train_set/data.list \
-            --cv_data data/dev/data.list \
-            ${checkpoint:+--checkpoint $checkpoint} \
-            --model_dir $dir \
-            --ddp.init_method $init_method \
-            --ddp.world_size $world_size \
-            --ddp.rank $rank \
-            --ddp.dist_backend $dist_backend \
-            --num_workers 2 \
-            $cmvn_opts
-    } &
-    done
-    wait
+    if [ ${train_engine} == "deepspeed" ]; then
+      echo "$0: using deepspeed"
+    else
+      echo "$0: using torch ddp"
+    fi
+    echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
+    torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+             --rdzv_id=2023 --rdzv_backend="c10d" \
+      wenet/bin/train.py \
+              --train_engine ${train_engine} \
+              --config $train_config \
+              --data_type raw \
+              --train_data data/$train_set/data.list \
+              --cv_data data/dev/data.list \
+              ${checkpoint:+--checkpoint $checkpoint} \
+              --model_dir $dir \
+              --ddp.dist_backend $dist_backend \
+              --num_workers 2 \
+              --pin_memory \
+              --deepspeed_config ${deepspeed_config} \
+              --deepspeed.save_states ${deepspeed_save_states}
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -158,29 +147,22 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     # -1 for full chunk
     decoding_chunk_size=
     ctc_weight=0.5
+    python wenet/bin/recognize.py --gpu 0 \
+      --modes $decode_modes \
+      --config $dir/train.yaml \
+      --data_type $data_type \
+      --test_data data/test/data.list \
+      --checkpoint $decode_checkpoint \
+      --beam_size 10 \
+      --batch_size 32 \
+      --blank_penalty 0.0 \
+      --ctc_weight $ctc_weight \
+      --result_dir $dir \
+      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
     for mode in ${decode_modes}; do
-    {
-        test_dir=$dir/test_${mode}
-        mkdir -p $test_dir
-        python wenet/bin/recognize.py --gpu 0 \
-            --mode $mode \
-            --config $dir/train.yaml \
-            --data_type raw \
-            --test_data data/test/data.list \
-            --checkpoint $decode_checkpoint \
-            --beam_size 10 \
-            --batch_size 1 \
-            --penalty 0.0 \
-            --dict $dict \
-            --ctc_weight $ctc_weight \
-            --result_file $test_dir/text \
-            ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
-         python tools/compute-wer.py --char=1 --v=1 \
-            data/test/text $test_dir/text > $test_dir/wer
-    } &
+      python tools/compute-wer.py --char=1 --v=1 \
+        data/test/text $dir/$mode/text > $dir/$mode/wer
     done
-    wait
-
 fi
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then

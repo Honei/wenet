@@ -5,21 +5,27 @@
 
 . ./path.sh || exit 1;
 
-# Use this to control how many gpu you use, It's 1-gpu training if you specify
-# just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+# Automatically detect number of gpus
+if command -v nvidia-smi &> /dev/null; then
+  num_gpus=$(nvidia-smi -L | wc -l)
+  gpu_list=$(seq -s, 0 $((num_gpus-1)))
+else
+  num_gpus=-1
+  gpu_list="-1"
+fi
+# You can also manually specify CUDA_VISIBLE_DEVICES
+# if you don't want to utilize all available GPU resources.
+export CUDA_VISIBLE_DEVICES="${gpu_list}"
+echo "CUDA_VISIBLE_DEVICES is ${CUDA_VISIBLE_DEVICES}"
 
 stage=0 # start from 0 if you need to start from data preparation
 stop_stage=5
 
-# The num of machines(nodes) for multi-machine training, 1 is for one machine.
-# NFS is required if num_nodes > 1.
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
 
-# The rank of each node or machine, which ranges from 0 to `num_nodes - 1`.
-# You should set the node_rank=0 on the first machine, set the node_rank=1
-# on the second machine, and so on.
-node_rank=0
 # The aishell dataset location, please change this to your own path
 # make sure of using absolute path. DO-NOT-USE relatvie path!
 data=/export/data/asr-data/OpenSLR/33/
@@ -36,7 +42,6 @@ num_utts_per_shard=1000
 
 train_set=train
 train_config=conf/conformer_u2pp_rnnt.yaml
-cmvn=true
 dir=exp/conformer_rnnt
 checkpoint=
 
@@ -45,6 +50,11 @@ average_checkpoint=true
 decode_checkpoint=$dir/final.pt
 average_num=30
 decode_modes="rnnt_beam_search"
+
+train_engine=torch_ddp
+
+deepspeed_config=../../aishell/s0/conf/ds_stage2.json
+deepspeed_save_states="model_only"
 
 . tools/parse_options.sh || exit 1;
 
@@ -81,11 +91,10 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
   mkdir -p $(dirname $dict)
   echo "<blank> 0" > ${dict}  # 0 is for "blank" in CTC
   echo "<unk> 1"  >> ${dict}  # <unk> must be 1
+  echo "<sos/eos> 2" >> $dict
   tools/text2token.py -s 1 -n 1 data/train/text | cut -f 2- -d" " \
     | tr " " "\n" | sort | uniq | grep -a -v -e '^\s*$' | \
-    awk '{print $0 " " NR+1}' >> ${dict}
-  num_token=$(cat $dict | wc -l)
-  echo "<sos/eos> $num_token" >> $dict
+    awk '{print $0 " " NR+2}' >> ${dict}
 fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
@@ -104,47 +113,34 @@ fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   mkdir -p $dir
-  # You have to rm `INIT_FILE` manually when you resume or restart a
-  # multi-machine training.
-  INIT_FILE=$dir/ddp_init
-  init_method=file://$(readlink -f $INIT_FILE)
-  echo "$0: init method is $init_method"
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
-  dist_backend="gloo"
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
-  cmvn_opts=
-  $cmvn && cp data/${train_set}/global_cmvn $dir
-  $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
+  dist_backend="nccl"
 
   # train.py rewrite $train_config to $dir/train.yaml with model input
   # and output dimension, and $dir/train.yaml will be used for inference
   # and export.
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
+  if [ ${train_engine} == "deepspeed" ]; then
+    echo "$0: using deepspeed"
+  else
+    echo "$0: using torch ddp"
+  fi
+  echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+           --rdzv_id=2023 --rdzv_backend="c10d" \
+    wenet/bin/train.py \
+      --train_engine ${train_engine} \
       --config $train_config \
       --data_type $data_type \
-      --symbol_table $dict \
       --train_data data/$train_set/data.list \
       --cv_data data/dev/data.list \
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
       --ddp.dist_backend $dist_backend \
       --num_workers 1 \
-      $cmvn_opts \
-      --pin_memory
-  } &
-  done
-  wait
+      --pin_memory \
+      --deepspeed_config ${deepspeed_config} \
+      --deepspeed.save_states ${deepspeed_save_states}
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -171,31 +167,25 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   search_transducer_weight=0.7
 
   reverse_weight=0.0
+  python wenet/bin/recognize.py --gpu 0 \
+    --modes $decode_modes \
+    --config $dir/train.yaml \
+    --data_type $data_type \
+    --test_data data/test/data.list \
+    --checkpoint $decode_checkpoint \
+    --beam_size 10 \
+    --batch_size 32 \
+    --blank_penalty 0.0 \
+    --ctc_weight $rescore_ctc_weight \
+    --transducer_weight $rescore_transducer_weight \
+    --attn_weight $rescore_attn_weight \
+    --search_ctc_weight $search_ctc_weight \
+    --search_transducer_weight $search_transducer_weight \
+    --reverse_weight $reverse_weight \
+    --result_dir $dir \
+    ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
   for mode in ${decode_modes}; do
-  {
-    test_dir=$dir/test_${mode}
-    mkdir -p $test_dir
-    python wenet/bin/recognize.py --gpu 0 \
-      --mode $mode \
-      --config $dir/train.yaml \
-      --data_type $data_type \
-      --test_data data/test/data.list \
-      --checkpoint $decode_checkpoint \
-      --beam_size 10 \
-      --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
-      --ctc_weight $rescore_ctc_weight \
-      --transducer_weight $rescore_transducer_weight \
-      --attn_weight $rescore_attn_weight \
-      --search_ctc_weight $search_ctc_weight \
-      --search_transducer_weight $search_transducer_weight \
-      --reverse_weight $reverse_weight \
-      --result_file $test_dir/text \
-      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
     python tools/compute-wer.py --char=1 --v=1 \
-      data/test/text $test_dir/text > $test_dir/wer
-  } &
+      data/test/text $dir/$mode/text > $dir/$mode/wer
   done
-  wait
 fi

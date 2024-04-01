@@ -15,11 +15,15 @@
 """Unility functions for Transformer."""
 
 import math
+import time
 from typing import List, Tuple
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
+from whisper.tokenizer import LANGUAGES as WhiserLanguages
+
+WHISPER_LANGS = tuple(WhiserLanguages.keys())
 IGNORE_ID = -1
 
 
@@ -43,14 +47,33 @@ def pad_list(xs: List[torch.Tensor], pad_value: int):
                 [1., 0., 0., 0.]])
 
     """
-    n_batch = len(xs)
-    max_len = max([x.size(0) for x in xs])
-    pad = torch.zeros(n_batch, max_len, dtype=xs[0].dtype, device=xs[0].device)
-    pad = pad.fill_(pad_value)
-    for i in range(n_batch):
-        pad[i, :xs[i].size(0)] = xs[i]
-
-    return pad
+    max_len = max([len(item) for item in xs])
+    batchs = len(xs)
+    ndim = xs[0].ndim
+    if ndim == 1:
+        pad_res = torch.zeros(batchs,
+                              max_len,
+                              dtype=xs[0].dtype,
+                              device=xs[0].device)
+    elif ndim == 2:
+        pad_res = torch.zeros(batchs,
+                              max_len,
+                              xs[0].shape[1],
+                              dtype=xs[0].dtype,
+                              device=xs[0].device)
+    elif ndim == 3:
+        pad_res = torch.zeros(batchs,
+                              max_len,
+                              xs[0].shape[1],
+                              xs[0].shape[2],
+                              dtype=xs[0].dtype,
+                              device=xs[0].device)
+    else:
+        raise ValueError(f"Unsupported ndim: {ndim}")
+    pad_res.fill_(pad_value)
+    for i in range(batchs):
+        pad_res[i, :len(xs[i])] = xs[i]
+    return pad_res
 
 
 def add_blank(ys_pad: torch.Tensor, blank: int,
@@ -133,6 +156,88 @@ def add_sos_eos(ys_pad: torch.Tensor, sos: int, eos: int,
     return pad_list(ys_in, eos), pad_list(ys_out, ignore_id)
 
 
+def add_whisper_tokens(special_tokens, ys_pad: torch.Tensor, ignore_id: int,
+                       tasks: List[str], no_timestamp: bool, langs: List[str],
+                       use_prev: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Add whisper-style tokens.
+
+    ([PREV] -> [previous text tokens or hotwords]).optional --
+      ┌------------------------------------------------------↲
+      ↓
+    [sot] -> [language id] -> [transcribe] -> [begin time] -> [text tokens] -> [end time] -> ... -> [eot]    # noqa
+        |          |                |-------> [no timestamps] -> [text tokens] ----------------------↑       # noqa
+        |          |                                                                                 |       # noqa
+        |          |--------> [translate]  -> [begin time] -> [text tokens] -> [end time] -> ... --->|       # noqa
+        |                           |-------> [no timestamps] -> [text tokens] --------------------->|       # noqa
+        |                                                                                            |       # noqa
+        |--> [no speech(VAD)] ---------------------------------------------------------------------->|       # noqa
+
+    Args:
+        special_tokens: get IDs of special tokens
+        ignore_id (int): index of padding
+        no_timestamp (bool): whether to add timestamps tokens
+        tasks (List[str]): list of task tags
+        langs (List[str]): list of language tags
+
+    Returns:
+        ys_in (torch.Tensor) : (B, Lmax + ?)
+        ys_out (torch.Tensor) : (B, Lmax + ?)
+
+    """
+    assert len(langs) == ys_pad.size(0)
+    assert len(tasks) == ys_pad.size(0)
+    if use_prev:
+        # i.e., hotword list
+        _prev = [special_tokens["sot_prev"]]
+        # append hotword list to _prev
+        # ...
+        raise NotImplementedError
+    else:
+        _prev = []
+
+    _sot = []
+    for task, lang in zip(tasks, langs):
+        if task == "transcribe":
+            task_id = special_tokens["transcribe"]
+        elif task == "translate":
+            task_id = special_tokens["translate"]
+        elif task == "vad":
+            task_id = special_tokens["no_speech"]
+        else:
+            raise NotImplementedError("unsupported task {}".format(task))
+        language_id = special_tokens["sot"] + 1 + WHISPER_LANGS.index(lang)
+        prefix = _prev + [special_tokens["sot"], language_id, task_id]
+        if task == "transcribe" or task == "translate":
+            if no_timestamp:
+                prefix.append(special_tokens["no_timestamps"])
+            else:
+                prefix.append(special_tokens["timestamp_begin"])
+                # add subsequent tokens
+                # ...
+                raise NotImplementedError
+        elif task == "vad":
+            prefix.append(special_tokens["no_speech"])
+        else:
+            raise NotImplementedError
+        prefix = torch.tensor(prefix,
+                              dtype=torch.long,
+                              requires_grad=False,
+                              device=ys_pad.device)
+        _sot.append(prefix)
+
+    _eot = torch.tensor([special_tokens["eot"]],
+                        dtype=torch.long,
+                        requires_grad=False,
+                        device=ys_pad.device)
+    ys = [y[y != ignore_id] for y in ys_pad]  # parse padded ys
+
+    ys_in = [torch.cat([prefix, y], dim=0) for prefix, y in zip(_sot, ys)]
+    ys_out = [
+        torch.cat([prefix[1:], y, _eot], dim=0) for prefix, y in zip(_sot, ys)
+    ]
+    return pad_list(ys_in, special_tokens["eot"]), pad_list(ys_out, ignore_id)
+
+
 def reverse_pad_list(ys_pad: torch.Tensor,
                      ys_lens: torch.Tensor,
                      pad_value: float = -1.0) -> torch.Tensor:
@@ -162,7 +267,7 @@ def reverse_pad_list(ys_pad: torch.Tensor,
 
 
 def th_accuracy(pad_outputs: torch.Tensor, pad_targets: torch.Tensor,
-                ignore_label: int) -> float:
+                ignore_label: int) -> torch.Tensor:
     """Calculate accuracy.
 
     Args:
@@ -171,7 +276,7 @@ def th_accuracy(pad_outputs: torch.Tensor, pad_targets: torch.Tensor,
         ignore_label (int): Ignore label id.
 
     Returns:
-        float: Accuracy value (0.0 - 1.0).
+        torch.Tensor: Accuracy value (0.0 - 1.0).
 
     """
     pad_pred = pad_outputs.view(pad_targets.size(0), pad_targets.size(1),
@@ -180,34 +285,7 @@ def th_accuracy(pad_outputs: torch.Tensor, pad_targets: torch.Tensor,
     numerator = torch.sum(
         pad_pred.masked_select(mask) == pad_targets.masked_select(mask))
     denominator = torch.sum(mask)
-    return float(numerator) / float(denominator)
-
-
-def get_rnn(rnn_type: str) -> torch.nn.Module:
-    assert rnn_type in ["rnn", "lstm", "gru"]
-    if rnn_type == "rnn":
-        return torch.nn.RNN
-    elif rnn_type == "lstm":
-        return torch.nn.LSTM
-    else:
-        return torch.nn.GRU
-
-
-def get_activation(act):
-    """Return activation function."""
-    # Lazy load to avoid unused import
-    from wenet.transformer.swish import Swish
-
-    activation_funcs = {
-        "hardtanh": torch.nn.Hardtanh,
-        "tanh": torch.nn.Tanh,
-        "relu": torch.nn.ReLU,
-        "selu": torch.nn.SELU,
-        "swish": getattr(torch.nn, "SiLU", Swish),
-        "gelu": torch.nn.GELU
-    }
-
-    return activation_funcs[act]()
+    return (numerator / denominator).detach()
 
 
 def get_subsample(config):
@@ -221,32 +299,7 @@ def get_subsample(config):
         return 8
 
 
-def remove_duplicates_and_blank(hyp: List[int]) -> List[int]:
-    new_hyp: List[int] = []
-    cur = 0
-    while cur < len(hyp):
-        if hyp[cur] != 0:
-            new_hyp.append(hyp[cur])
-        prev = cur
-        while cur < len(hyp) and hyp[cur] == hyp[prev]:
-            cur += 1
-    return new_hyp
-
-
-def replace_duplicates_with_blank(hyp: List[int]) -> List[int]:
-    new_hyp: List[int] = []
-    cur = 0
-    while cur < len(hyp):
-        new_hyp.append(hyp[cur])
-        prev = cur
-        cur += 1
-        while cur < len(hyp) and hyp[cur] == hyp[prev] and hyp[cur] != 0:
-            new_hyp.append(0)
-            cur += 1
-    return new_hyp
-
-
-def log_add(args: List[int]) -> float:
+def log_add(*args) -> float:
     """
     Stable log add
     """
@@ -255,3 +308,33 @@ def log_add(args: List[int]) -> float:
     a_max = max(args)
     lsp = math.log(sum(math.exp(a - a_max) for a in args))
     return a_max + lsp
+
+
+def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    assert mask.dtype == torch.bool
+    assert dtype in [torch.float32, torch.bfloat16, torch.float16]
+    mask = mask.to(dtype)
+    # attention mask bias
+    # NOTE(Mddct): torch.finfo jit issues
+    #     chunk_masks = (1.0 - chunk_masks) * torch.finfo(dtype).min
+    mask = (1.0 - mask) * -1.0e+10
+    return mask
+
+
+class StepTimer:
+    """Utility class for measuring steps/second."""
+
+    def __init__(self, step=0.0):
+        self.last_iteration = step
+        self.start()
+
+    def start(self):
+        self.last_time = time.time()
+
+    def steps_per_second(self, cur_step, restart=True):
+        value = ((float(cur_step) - self.last_iteration) /
+                 (time.time() - self.last_time))
+        if restart:
+            self.start()
+            self.last_iteration = float(cur_step)
+        return value

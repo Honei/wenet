@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 #include "decoder/ctc_endpoint.h"
 
 #include <math.h>
@@ -55,7 +54,7 @@ bool CtcEndpoint::IsEndpoint(
     float blank_prob = expf(logp_t[config_.blank]);
 
     num_frames_decoded_++;
-    if (blank_prob > config_.blank_threshold) {
+    if (blank_prob > config_.blank_threshold * config_.blank_scale) {
       num_frames_trailing_blank_++;
     } else {
       num_frames_trailing_blank_ = 0;
